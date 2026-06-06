@@ -28,7 +28,14 @@ from typing import TYPE_CHECKING, List, Optional, NamedTuple, Any
 try:
     import msgspec
 except ImportError:
-    msgspec = None
+    class _StructFallback:
+        def __init_subclass__(cls, **kwargs):
+            super().__init_subclass__()
+
+    class _MsgspecFallback:
+        Struct = _StructFallback
+
+    msgspec = _MsgspecFallback()
 from .logger import get_logger
 
 GB_TO_BYTE = 1024 * 1024 * 1024
