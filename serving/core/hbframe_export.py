@@ -31,7 +31,15 @@ class HBFrameFrontendConfig:
     npu_mem_gb: float = 80.0
     cpu_mem_gb: float = 512.0
     cxl_mem_gb: float = 0.0
+    npu_kv_capacity_mb: float | None = None
+    weight_residency: str = "npu"
     num_npus: int = 1
+    num_instances: int = 1
+    pd_mode: str = "colocated"
+    prefill_instances: int = 1
+    decode_instances: int = 1
+    pd_handoff_policy: str = "metadata_only"
+    pd_handoff_latency_ns: int = 0
     tp_size: int = 1
     pp_size: int = 1
     ep_size: int = 1
@@ -162,6 +170,8 @@ def snapshot_batch(batch, scheduler: Scheduler) -> HBFrameBatchSnapshot:
         attrs={
             "fired": tuple(int(value) for value in batch.fired),
             "end": tuple(int(value) for value in batch.end),
+            "pd_role": scheduler.pd_type or "colocated",
+            "hbframe_scheduler_decision": dict(getattr(scheduler, "_hbframe_last_decision", {}) or {}),
         },
     )
 
@@ -169,44 +179,86 @@ def snapshot_batch(batch, scheduler: Scheduler) -> HBFrameBatchSnapshot:
 class HBFrameServingFrontend:
     """Callable LLMServingSim scheduler wrapper for HBFrame."""
 
-    def __init__(self, config: HBFrameFrontendConfig):
+    def __init__(self, config: HBFrameFrontendConfig, scheduler_oracle=None):
         self.config = config
         prefix_storage = _prefix_storage_device(config.prefix_storage)
-        self.scheduler = Scheduler(
-            config.model,
-            config.node_id,
-            config.instance_id,
-            config.max_num_seqs,
-            config.max_num_batched_tokens,
-            config.num_npus,
-            config.tp_size,
-            config.pp_size,
-            config.npu_mem_gb,
-            config.cpu_mem_gb,
-            config.start_npu,
-            config.pd_type,
-            config.dtype_bits,
-            config.block_size,
-            config.req_num,
-            config.prioritize_prefill,
-            config.enable_prefix_caching,
-            config.enable_prefix_sharing,
-            None,
-            prefix_storage,
-            config.enable_chunked_prefill,
-            config.long_prefill_token_threshold,
-            config.cxl_mem_gb,
-            ep_size=config.ep_size,
-            kv_cache_dtype=config.kv_cache_dtype,
-        )
+        self.schedulers = []
+        self._prefill_schedulers = []
+        self._decode_schedulers = []
+        self._pd_handoff_records: list[dict[str, object]] = []
+        self._pd_decode_rr_counter = 0
+
+        def _make_scheduler(index: int, pd_type: str | None, *, start_npu: int | None = None):
+            scheduler = Scheduler(
+                config.model,
+                config.node_id,
+                config.instance_id + index,
+                config.max_num_seqs,
+                config.max_num_batched_tokens,
+                config.num_npus,
+                config.tp_size,
+                config.pp_size,
+                config.npu_mem_gb,
+                config.cpu_mem_gb,
+                config.start_npu if start_npu is None else start_npu,
+                pd_type,
+                config.dtype_bits,
+                config.block_size,
+                config.req_num,
+                config.prioritize_prefill,
+                config.enable_prefix_caching,
+                config.enable_prefix_sharing,
+                None,
+                prefix_storage,
+                config.enable_chunked_prefill,
+                config.long_prefill_token_threshold,
+                config.cxl_mem_gb,
+                ep_size=config.ep_size,
+                kv_cache_dtype=config.kv_cache_dtype,
+                weight_residency=config.weight_residency,
+            )
+            if config.npu_kv_capacity_mb is not None:
+                kv_bytes = int(float(config.npu_kv_capacity_mb) * 1024 * 1024)
+                resident_weight = int(getattr(scheduler.memory, "resident_weight", scheduler.memory.weight))
+                scheduler.memory.npu_mem = resident_weight + max(0, kv_bytes)
+                if getattr(scheduler.memory, "enable_prefix_caching", False):
+                    scheduler.memory.mem_for_kv = max(0, scheduler.memory.npu_mem - resident_weight)
+                    if hasattr(scheduler.memory, "npu_prefix_cache"):
+                        scheduler.memory.npu_prefix_cache.capacity = scheduler.memory.mem_for_kv
+            scheduler.hbframe_oracle = scheduler_oracle
+            return scheduler
+
+        if str(config.pd_mode).lower() == "disaggregated":
+            prefill_count = max(1, int(config.prefill_instances))
+            decode_count = max(1, int(config.decode_instances))
+            for index in range(prefill_count):
+                scheduler = _make_scheduler(index, "prefill", start_npu=config.start_npu + index * config.num_npus)
+                self.schedulers.append(scheduler)
+                self._prefill_schedulers.append(scheduler)
+            for index in range(decode_count):
+                absolute_index = prefill_count + index
+                scheduler = _make_scheduler(absolute_index, "decode", start_npu=config.start_npu + absolute_index * config.num_npus)
+                self.schedulers.append(scheduler)
+                self._decode_schedulers.append(scheduler)
+        else:
+            for index in range(max(1, int(config.num_instances))):
+                scheduler = _make_scheduler(index, config.pd_type)
+                self.schedulers.append(scheduler)
+            self._prefill_schedulers = list(self.schedulers)
+            self._decode_schedulers = []
+        self.scheduler = self.schedulers[0]
         self.router = Router(
-            1,
-            [self.scheduler],
+            len(self.schedulers),
+            self.schedulers,
             config.req_num,
             routing_policy=config.request_routing_policy,
         )
         self.current_time_ns = 0
-        self._active_batches: dict[int, object] = {}
+        self._active_batches: dict[tuple[int, int], object] = {}
+
+    @property
+    def pd_disaggregated(self) -> bool:
+        return str(self.config.pd_mode).lower() == "disaggregated"
 
     def load_requests(self, path: str | Path) -> None:
         """Load a JSONL workload path without depending on ``astra-sim`` cwd."""
@@ -239,69 +291,137 @@ class HBFrameServingFrontend:
     def schedule_next(self, current_time_ns: int | None = None) -> HBFrameBatchSnapshot | None:
         if current_time_ns is not None:
             self.route_arrivals(int(current_time_ns))
-        batch = self.scheduler.schedule(self.current_time_ns, self.scheduler.start_npu)
-        if batch is None:
-            return None
-        self._active_batches[int(batch.batch_id)] = batch
-        return snapshot_batch(batch, self.scheduler)
+        for scheduler in self.schedulers:
+            batch = scheduler.schedule(self.current_time_ns, scheduler.start_npu)
+            if batch is None:
+                continue
+            self._active_batches[(int(scheduler.instance_id), int(batch.batch_id))] = batch
+            return snapshot_batch(batch, scheduler)
+        return None
 
-    def complete_batch(self, batch_id: int, completion_time_ns: int) -> tuple[dict[str, object], ...]:
+    def complete_batch(self, batch_id: int, completion_time_ns: int, instance_id: int | None = None) -> tuple[dict[str, object], ...]:
         """Mark a scheduled batch complete and return newly finished requests."""
         batch_id = int(batch_id)
         completion_time_ns = int(completion_time_ns)
-        if batch_id not in self._active_batches:
-            raise KeyError(f"Unknown active batch_id={batch_id}")
-        prompt_t, gen_t, finished = self.scheduler.add_done(
-            batch_id + 1,
-            self.scheduler.start_npu,
-            completion_time_ns,
-        )
-        self._active_batches.pop(batch_id, None)
+        if instance_id is None:
+            matches = [key for key in self._active_batches if key[1] == batch_id]
+            if len(matches) != 1:
+                raise KeyError(f"Unknown or ambiguous active batch_id={batch_id}")
+            instance_id = matches[0][0]
+        key = (int(instance_id), batch_id)
+        if key not in self._active_batches:
+            raise KeyError(f"Unknown active batch key={key}")
+        scheduler = next(item for item in self.schedulers if int(item.instance_id) == int(instance_id))
+        prompt_t, gen_t, finished = self._complete_scheduler_batch(scheduler, batch_id, completion_time_ns)
+        self._active_batches.pop(key, None)
         self.current_time_ns = max(self.current_time_ns, completion_time_ns)
+        if self.pd_disaggregated and scheduler.pd_type == "prefill":
+            self._handoff_prefill_requests(finished, completion_time_ns, from_instance_id=int(instance_id), batch_id=batch_id)
+            return ()
         for req in finished:
             self.router.notify_request_completed(req.id, completion_time_ns)
-        return tuple(
-            {
-                "id": int(req.id),
-                "arrival_time_ns": int(req.arrival),
-                "end_time_ns": int(req.end_time),
-                "latency_ns": int(req.latency),
-                "ttft_ns": int(req.ttft),
-                "tpot_ns": int(req.tpot),
-                "itl_ns": [int(value) for value in req.itl],
-                "prompt_tokens_accounted": int(prompt_t),
-                "generation_tokens_accounted": int(gen_t),
-            }
-            for req in finished
-        )
+        return tuple(self._metric_dict(req, prompt_t=prompt_t, gen_t=gen_t) for req in finished)
+
+    def _complete_scheduler_batch(self, scheduler: Scheduler, batch_id: int, completion_time_ns: int):
+        systems = [int(scheduler.start_npu)]
+        if scheduler.pd_type == "prefill":
+            systems.append(int(scheduler.start_npu + scheduler.num_npus * 2 - 1))
+        elif int(scheduler.num_npus) > 1:
+            systems.append(int(scheduler.start_npu + scheduler.num_npus - 1))
+        prompt_t = 0
+        gen_t = 0
+        finished = []
+        seen = set()
+        for sys_id in dict.fromkeys(systems):
+            prompt_t, gen_t, finished = scheduler.add_done(batch_id + 1, sys_id, completion_time_ns)
+            if finished:
+                seen.update(int(req.id) for req in finished)
+        return prompt_t, gen_t, finished
+
+    def _handoff_prefill_requests(self, requests, completion_time_ns: int, *, from_instance_id: int, batch_id: int) -> None:
+        if not requests:
+            return
+        decode_schedulers = self._decode_schedulers or [scheduler for scheduler in self.schedulers if scheduler.pd_type == "decode"]
+        if not decode_schedulers:
+            raise RuntimeError("PD disaggregated mode requires at least one decode scheduler")
+        ready_time_ns = int(completion_time_ns) + max(0, int(self.config.pd_handoff_latency_ns))
+        for req in requests:
+            decode_scheduler = decode_schedulers[self._pd_decode_rr_counter % len(decode_schedulers)]
+            self._pd_decode_rr_counter += 1
+            original_arrival = int(getattr(req, "hbframe_original_arrival", req.arrival))
+            req.hbframe_original_arrival = original_arrival
+            req.hbframe_prefill_ttft = int(req.ttft)
+            req.hbframe_prefill_done_ns = int(completion_time_ns)
+            req.hbframe_handoff_ready_ns = int(ready_time_ns)
+            req.arrival = int(ready_time_ns)
+            decode_scheduler.add_decode(req)
+            decode_scheduler.request.sort(key=lambda item: (item.arrival, item.id))
+            self._pd_handoff_records.append(
+                {
+                    "request_id": int(req.id),
+                    "from_instance_id": int(from_instance_id),
+                    "to_instance_id": int(decode_scheduler.instance_id),
+                    "prefill_batch_id": int(batch_id),
+                    "prefill_done_ns": int(completion_time_ns),
+                    "decode_ready_ns": int(ready_time_ns),
+                    "policy": self.config.pd_handoff_policy,
+                    "input_tokens": int(req.original_input),
+                    "computed_tokens": int(req.num_computed_tokens),
+                }
+            )
+
+    def _metric_dict(self, req, *, prompt_t: int = 0, gen_t: int = 0) -> dict[str, object]:
+        arrival_ns = int(getattr(req, "hbframe_original_arrival", req.arrival))
+        end_ns = int(req.end_time)
+        latency_ns = max(0, end_ns - arrival_ns)
+        ttft_ns = int(getattr(req, "hbframe_prefill_ttft", req.ttft))
+        output_tokens = max(0, int(req.output) - int(req.original_input))
+        if output_tokens <= 1:
+            tpot_ns = 0
+        else:
+            tpot_ns = max(0, latency_ns - ttft_ns) // max(1, output_tokens - 1)
+        return {
+            "id": int(req.id),
+            "arrival_time_ns": arrival_ns,
+            "end_time_ns": end_ns,
+            "latency_ns": latency_ns,
+            "ttft_ns": ttft_ns,
+            "tpot_ns": int(tpot_ns),
+            "itl_ns": [int(value) for value in req.itl],
+            "prompt_tokens_accounted": int(prompt_t),
+            "generation_tokens_accounted": int(gen_t),
+        }
 
     def next_arrival_time_ns(self) -> int | None:
+        candidates = []
         value = self.router.get_next_pending_arrival()
-        return None if value is None else int(value)
+        if value is not None:
+            candidates.append(int(value))
+        for scheduler in self.schedulers:
+            if scheduler.request:
+                candidates.append(int(scheduler.request[0].arrival))
+        return min(candidates) if candidates else None
 
     def has_pending_work(self) -> bool:
         return (
             self.router.has_pending_requests()
             or bool(self.scheduler.request)
-            or bool(self.scheduler.inflight)
+            or any(bool(scheduler.request) or bool(scheduler.inflight) for scheduler in self.schedulers)
             or bool(self._active_batches)
         )
 
     def request_metrics(self) -> tuple[dict[str, object], ...]:
         return tuple(
             {
-                "id": int(req.id),
-                "arrival_time_ns": int(req.arrival),
-                "end_time_ns": int(req.end_time),
-                "latency_ns": int(req.latency),
-                "ttft_ns": int(req.ttft),
-                "tpot_ns": int(req.tpot),
-                "itl_ns": [int(value) for value in req.itl],
+                **self._metric_dict(req),
                 "input_tokens": int(req.original_input),
                 "output_tokens": int(req.output),
             }
-            for req in sorted(self.scheduler.done, key=lambda item: item.id)
+            for req in sorted((req for scheduler in self.schedulers for req in scheduler.done), key=lambda item: item.id)
         )
+
+    def pd_handoffs(self) -> tuple[dict[str, object], ...]:
+        return tuple(dict(record) for record in self._pd_handoff_records)
 
     def dump_step(self, snapshot: HBFrameBatchSnapshot, handle) -> None:
         handle.write(json.dumps(snapshot.to_dict(), sort_keys=True) + "\n")

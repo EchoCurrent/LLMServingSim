@@ -29,6 +29,10 @@ try:
     import msgspec
 except ImportError:
     class _StructFallback:
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
         def __init_subclass__(cls, **kwargs):
             super().__init_subclass__()
 

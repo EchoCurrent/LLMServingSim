@@ -19,7 +19,7 @@ class Scheduler:
                  num_npus, tp_size, pp_size, npu_mem, cpu_mem,
                  start_npu, pd_type, fp, block_size, req_num,
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
-                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto'):
+                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto', weight_residency='npu'):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -45,10 +45,65 @@ class Scheduler:
         self.batch_ids = -1
 
         # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype)
+        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype, weight_residency=weight_residency)
+        self.hbframe_oracle = None
+        self._hbframe_last_decision = {}
 
         # logger
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
+
+    def _apply_hbframe_oracle_batch_filter(self, current, batch_req, scheduled_tokens):
+        oracle = getattr(self, "hbframe_oracle", None)
+        if oracle is None or not hasattr(oracle, "filter_scheduler_batch"):
+            self._hbframe_last_decision = {}
+            return batch_req, scheduled_tokens
+        filtered_req, filtered_tokens, decision = oracle.filter_scheduler_batch(
+            scheduler=self,
+            current=current,
+            batch_req=batch_req,
+            scheduled_tokens=scheduled_tokens,
+        )
+        self._hbframe_last_decision = dict(decision or {})
+        return filtered_req, filtered_tokens
+
+    def _apply_hbframe_prefix_decision(self, req):
+        oracle = getattr(self, "hbframe_oracle", None)
+        if oracle is None or not hasattr(oracle, "adjust_prefix_match"):
+            return
+        decision = oracle.adjust_prefix_match(scheduler=self, req=req)
+        if not decision:
+            return
+        if "npu_cache_hit" in decision:
+            req.npu_cache_hit = int(decision["npu_cache_hit"])
+        if "storage_cache_hit" in decision:
+            req.storage_cache_hit = int(decision["storage_cache_hit"])
+        if "prefix_cache_hit" in decision:
+            req.prefix_cache_hit = int(decision["prefix_cache_hit"])
+        req.num_computed_tokens = max(int(req.num_computed_tokens), int(getattr(req, "prefix_cache_hit", 0)))
+        self._hbframe_last_decision.setdefault("prefix_decisions", []).append(dict(decision))
+
+    def _choose_hbframe_eviction_victim(self, candidates, required_bytes=0):
+        oracle = getattr(self, "hbframe_oracle", None)
+        if oracle is None or not hasattr(oracle, "choose_scheduler_eviction"):
+            return candidates[-1] if candidates else None
+        decision = oracle.choose_scheduler_eviction(
+            scheduler=self,
+            candidates=candidates,
+            required_bytes=required_bytes,
+        )
+        victim_id = None if not decision else decision.get("victim_request_id")
+        self._hbframe_last_decision.setdefault("eviction_decisions", []).append(dict(decision or {}))
+        for req in candidates:
+            if int(req.id) == int(victim_id):
+                return req
+        return candidates[-1] if candidates else None
+
+    def _filter_by_pd_role(self, batch_req):
+        if self.pd_type == "prefill":
+            return [req for req in batch_req if req.is_prefill()]
+        if self.pd_type == "decode":
+            return [req for req in batch_req if not req.is_prefill()]
+        return batch_req
     
  
     def schedule(self, current, sys, batch_id=-1):
@@ -83,6 +138,10 @@ class Scheduler:
 
             # can make batch and proceed
             batch_req = batch_req[:batch_len]
+            batch_req = self._filter_by_pd_role(batch_req)
+            batch_len = len(batch_req)
+            if batch_len == 0:
+                return None
 
             kv_size = 0
             evict_size = 0
@@ -171,6 +230,11 @@ class Scheduler:
                 if batch_len == 0:
                     print("     [WARNNING] Cannot load the request to batch due to max_num_batched_tokens limitation")
                     return None
+            batch_req, scheduled_tokens = self._apply_hbframe_oracle_batch_filter(current, batch_req, scheduled_tokens)
+            batch_len = len(batch_req)
+            gen_req = [req for req in batch_req if not req.is_prefill()]
+            if batch_len == 0:
+                return None
             # ============ STEP 2: KV size calculation (with scheduled_tokens) ============
             temp_len = batch_len
             for i in range(batch_len, -1, -1):
@@ -191,11 +255,14 @@ class Scheduler:
                     gen_req = gen_req[:-1]
                     continue
 
-                # else
-                evict_size += self.memory.get_evict_kv(gen_req[-1])
-                gen_req[-1].evict = True
-                self.logger.info("Eviction of the request #%d", gen_req[-1].id)
-                gen_req = gen_req[:-1]
+                victim = self._choose_hbframe_eviction_victim(gen_req, kv_size)
+                if victim is None:
+                    return None
+                evict_size += self.memory.get_evict_kv(victim)
+                victim.evict = True
+                self.logger.info("Eviction of the request #%d", victim.id)
+                gen_req = [req for req in gen_req if req.id != victim.id]
+                batch_req = [req for req in batch_req if req.id != victim.id]
                 # spill to cpu (host) memory. get_evict_kv returns per-rank
                 # bytes; cpu_used is tracked in full-cluster bytes (matches
                 # MemoryModel.apply_kv_cache_events convention), so scale by
@@ -343,6 +410,10 @@ class Scheduler:
 
             # can make batch and proceed
             batch_req = batch_req[:batch_len]
+            batch_req = self._filter_by_pd_role(batch_req)
+            batch_len = len(batch_req)
+            if batch_len == 0:
+                return None
 
             # Prioritize prefill (without chunked prefill) or reorder for chunked prefill
             if self.prioritize_prefill and not self.enable_chunked_prefill:
@@ -397,6 +468,7 @@ class Scheduler:
                         # because it is already considered in "self.memory.prefix_match(req)" -> req.num_computed_tokens
                         if req.num_computed_tokens == 0:
                             self.memory.prefix_match(req)
+                            self._apply_hbframe_prefix_decision(req)
                         remaining = req.original_input - req.num_computed_tokens
                         # Per-request cap: long_prefill_token_threshold
                         if 0 < threshold < remaining:
@@ -419,6 +491,7 @@ class Scheduler:
                     if req.is_prefill():
                         if req.num_computed_tokens == 0:
                             self.memory.prefix_match(req)
+                            self._apply_hbframe_prefix_decision(req)
                         # Consider prefix cache hit for non-chunked prefill
                         prefix_hit = req.prefix_cache_hit
                         tokens_to_compute = max(req.original_input - prefix_hit, 1)
@@ -435,6 +508,11 @@ class Scheduler:
                     del scheduled_tokens[last_req.id]
                     batch_req = batch_req[:-1]
                     batch_len -= 1
+            batch_req, scheduled_tokens = self._apply_hbframe_oracle_batch_filter(current, batch_req, scheduled_tokens)
+            batch_len = len(batch_req)
+            gen_req = [req for req in batch_req if not req.is_prefill()]
+            if batch_len == 0:
+                return None
             
             # ============ STEP 1.5: Lock prefix for scheduled requests ============
             newly_locked = set()
@@ -480,17 +558,21 @@ class Scheduler:
                 # Evict the last decode request
                 # (DEPRECATED) self.memory.unlock_prefix(gen_req[-1], Device.NPU)
                 # (DEPRECATED) self.memory.erase_prefix_info(gen_req[-1])
-                if gen_req[-1].is_prefill() and getattr(gen_req[-1], '_prefix_locked', False):
-                    self.memory.unlock_prefix(gen_req[-1], Device.NPU)
+                victim = self._choose_hbframe_eviction_victim(gen_req, kv_size)
+                if victim is None:
+                    return None
+                if victim.is_prefill() and getattr(victim, '_prefix_locked', False):
+                    self.memory.unlock_prefix(victim, Device.NPU)
                     # self.memory.erase_prefix_info(gen_req[-1])
-                    gen_req[-1]._prefix_locked = False
+                    victim._prefix_locked = False
                 
                 current_usable_size = self.memory.avail_size(Device.NPU) + self.memory.evictable_size(Device.NPU)
                 
-                gen_req[-1].evict = True
-                evicted_req.append(gen_req[-1])
-                self.logger.info("Eviction of the request #%d", gen_req[-1].id)
-                gen_req = gen_req[:-1]
+                victim.evict = True
+                evicted_req.append(victim)
+                self.logger.info("Eviction of the request #%d", victim.id)
+                gen_req = [req for req in gen_req if req.id != victim.id]
+                batch_req = [req for req in batch_req if req.id != victim.id]
                 
                 if len(gen_req) < batch_len:
                     batch_len = len(gen_req)
@@ -537,6 +619,7 @@ class Scheduler:
                 # Handle evicted requests
                 if req.evict:
                     self.memory.prefix_match(req)
+                    self._apply_hbframe_prefix_decision(req)
                     self.memory.lock_prefix(req, Device.NPU)
                     if self.prefix_storage is not None:
                         self.memory.unlock_prefix(req, Device.CPU)

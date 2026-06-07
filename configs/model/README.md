@@ -46,6 +46,7 @@ dimensional fields.
 | `meta-llama/Llama-3.1-70B.json` | dense | 80 | 8192 | 64 | 8 | — |
 | `Qwen/Qwen3-32B.json` | dense | 64 | 5120 | 64 | 8 | — |
 | `Qwen/Qwen3-30B-A3B-Instruct-2507.json` | MoE | 48 | 2048 | 32 | 4 | 128E / top-8 |
+| `deepseek-ai/DeepSeek-V3.json` | MoE | 61 | 7168 | 128 | MLA | 256E / top-8 + 1 shared |
 | `mistralai/Mixtral-8x7B-v0.1.json` | MoE | 32 | 4096 | 32 | 8 | 8E / top-2 |
 | `microsoft/Phi-mini-MoE-instruct.json` | MoE | 32 | 4096 | 32 | 8 | 16E / top-2 |
 
@@ -105,8 +106,11 @@ The profiler only runs when a matching architecture yaml exists at
 * `llama` — Llama 3.x family (uses `Llama3RotaryEmbedding`)
 * `qwen3` — Qwen3 dense family
 * `qwen3_moe` — Qwen3 MoE family
+* `deepseek_v3` — DeepSeek V3 MoE family; current catalog is intended for
+  serving/HBFrame front-end integration first. Full profiler use should add
+  MLA-specific projection sizing before treating CUDA-profiled latency as final.
 * `mixtral` — Mixtral family
 * `phimoe` — Phi MoE family
 
-Any other `model_type` (e.g. `gemma2`, `deepseek_v3`) produces a clear
-error at profile time with instructions for adding support.
+Any other `model_type` (e.g. `gemma2`) produces a clear error at profile
+time with instructions for adding support.

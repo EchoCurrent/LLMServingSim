@@ -1,0 +1,51 @@
+# DeepSeek V3 family - MoE decoder-only LLMs with MLA attention.
+#
+# This catalog is enough for LLMServingSim/HBFrame serving-front-end model
+# registration and first-order trace walking. DeepSeek V3's real vLLM module
+# graph uses MLA-specific projections (q_a/q_b/kv_a/kv_b). The current
+# LLMServingSim trace_generator still sizes attention through the common
+# canonical qkv_proj/attention/o_proj path, so this file keeps those canonical
+# names while binding them to the nearest vLLM classes. If LLMServingSim's own
+# profiler is used for DeepSeek V3 later, add MLA-specific sizing/sequence
+# support before treating profiler latency as final.
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, qkv_proj, rotary_emb, attention]
+  post_attn: [o_proj, layernorm]
+  mlp_dense: []
+  mlp_moe:   [moe]
+  head:      [final_layernorm, lm_head, sampler]
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2DecoderLayer
+      tp_stable: true
+    qkv_proj:
+      vllm: ReplicatedLinear
+      within: DeepseekV2MLAAttention
+    rotary_emb:
+      vllm: DeepseekV2MLAAttention
+    o_proj:
+      vllm: RowParallelLinear
+      within: DeepseekV2MLAAttention
+    final_layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2Model
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: Attention
+  moe:
+    moe:
+      vllm: FusedMoE

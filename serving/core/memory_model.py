@@ -8,13 +8,57 @@ GB_TO_BYTE = 1024 * 1024 * 1024
 MB_TO_BYTE = 1024 * 1024
 KB_TO_BYTE = 1024
 
+def _uses_mla(config):
+    return all(int(config.get(key, 0) or 0) > 0 for key in (
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+        "kv_lora_rank",
+    ))
+
+def _attention_dims(config):
+    n_embd = config['hidden_size']
+    n_head = config['num_attention_heads']
+    if _uses_mla(config):
+        qk_nope_head_dim = int(config["qk_nope_head_dim"])
+        qk_rope_head_dim = int(config["qk_rope_head_dim"])
+        qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        v_head_dim = int(config["v_head_dim"])
+        kv_lora_rank = int(config["kv_lora_rank"])
+        return {
+            "is_mla": True,
+            "head_dim": qk_head_dim,
+            "kv_head": 1,
+            "q_dim": n_head * qk_head_dim,
+            "v_dim": n_head * v_head_dim,
+            # vLLM MLA stores one latent KV vector per token, not separate
+            # per-head K and V tensors.
+            "kv_cache_dim": kv_lora_rank + qk_rope_head_dim,
+            "qk_nope_head_dim": qk_nope_head_dim,
+            "qk_rope_head_dim": qk_rope_head_dim,
+            "v_head_dim": v_head_dim,
+            "kv_lora_rank": kv_lora_rank,
+            "q_lora_rank": config.get("q_lora_rank"),
+        }
+    head_dim = config.get('head_dim', n_embd // n_head)
+    kv_head = config.get("num_key_value_heads", n_head)
+    kv_dim = kv_head * head_dim
+    return {
+        "is_mla": False,
+        "head_dim": head_dim,
+        "kv_head": kv_head,
+        "q_dim": n_head * head_dim,
+        "v_dim": n_head * head_dim,
+        "kv_cache_dim": kv_dim,
+    }
+
 class Device(Enum):
     NPU = 1
     CPU = 2
     CXL = 3
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto'):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', weight_residency='npu'):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -36,10 +80,12 @@ class MemoryModel():
         self.n_embd = self.config['hidden_size']
         self.n_layer = self.config['num_hidden_layers']
         self.n_head = self.config['num_attention_heads']
-        self.head_dim = self.config.get('head_dim', self.n_embd // self.n_head)
-        self.kv_head = self.config.get("num_key_value_heads", self.n_head)  # fallback to n_head if not defined
-        self.q_dim = self.n_head * self.head_dim       # total Q projection output dim
-        self.kv_dim = self.kv_head * self.head_dim     # total KV projection output dim
+        attention_dims = _attention_dims(self.config)
+        self.head_dim = attention_dims["head_dim"]
+        self.kv_head = attention_dims["kv_head"]
+        self.q_dim = attention_dims["q_dim"]
+        self.kv_dim = attention_dims["kv_cache_dim"]
+        self.uses_mla = attention_dims["is_mla"]
         self.vocab_size = self.config['vocab_size']
         # Accept either the Mistral-style ``num_local_experts`` or the
         # HF/Qwen-style ``num_experts`` key — profiler configs track
@@ -48,16 +94,25 @@ class MemoryModel():
 
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
 
-        # Memory model
-        self.weight = self.get_weight() # assume weight is loaded
-        self.npu_used = self.weight
+        # Memory model. The default preserves LLMServingSim's original
+        # assumption that full weights are resident on NPU memory. HBFrame can
+        # explicitly request offloaded weights and model weight movement itself.
+        self.weight = self.get_weight()
+        self.weight_residency = str(weight_residency or 'npu').lower()
+        npu_resident_modes = {'npu', 'hbm', 'resident', 'resident_npu'}
+        offloaded_modes = {'offload', 'offloaded', 'streaming', 'external', 'hbf', 'ssd', 'cpu'}
+        if self.weight_residency not in npu_resident_modes and self.weight_residency not in offloaded_modes:
+            raise ValueError(f"Unsupported weight_residency: {weight_residency}")
+        self.weight_resident_on_npu = self.weight_residency in npu_resident_modes
+        self.resident_weight = self.weight if self.weight_resident_on_npu else 0
+        self.npu_used = self.resident_weight
         self.cpu_used = 0
-        if self.weight > self.npu_mem:
+        if self.weight_resident_on_npu and self.weight > self.npu_mem:
             raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.num_npus//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.num_npus//GB_TO_BYTE}GB")
 
         if enable_prefix_caching:
             one_token_kv_size = self.get_kv(1)
-            self.mem_for_kv = self.npu_mem - self.weight
+            self.mem_for_kv = self.npu_mem - self.resident_weight
             self.npu_prefix_cache = RadixCache(device='NPU', 
                                                node_id=self.node_id,
                                                instance_id=self.instance_id,
@@ -148,8 +203,8 @@ class MemoryModel():
         # (kv_head, batch_size, n_embd//n_head, seq_len) per layer
         # return batch_size = 1 to caclulate max batch_size in scheduler
 
-        # K & V multiply 2
-        return 2 * self.kv_dim * seq * self.n_layer * self.kv_fp // self.num_npus
+        kv_factor = 1 if self.uses_mla else 2
+        return kv_factor * self.kv_dim * seq * self.n_layer * self.kv_fp // self.num_npus
     
     # get the total size of current kv cache for the request
     # used when adding prefilled request to decode instance.
@@ -217,7 +272,13 @@ class MemoryModel():
         return evict_size
 
     def free_weight(self):
-        if self.npu_used - self.weight < 0:
+        if not self.weight_resident_on_npu:
+            self.logger.info(
+                "NPU: model weight %.2fMB is not resident; no NPU weight memory to free",
+                self.weight / MB_TO_BYTE,
+            )
+            return
+        if self.npu_used - self.resident_weight < 0:
             raise RuntimeError(
                 f"[MemoryModel] [node={self.node_id}, inst={self.instance_id}] NPU: tried to free model weight {self.weight / MB_TO_BYTE:.2f}MB "
                 f"but only {self.npu_used / MB_TO_BYTE:.2f}MB is used."
@@ -226,9 +287,9 @@ class MemoryModel():
             "NPU: used: %.2fMB remove: %.2fMB after: %.2fMB",
             self.npu_used / MB_TO_BYTE,
             self.weight / MB_TO_BYTE,
-            (self.npu_used - self.weight) / MB_TO_BYTE,
+            (self.npu_used - self.resident_weight) / MB_TO_BYTE,
         )
-        self.npu_used -= self.weight
+        self.npu_used -= self.resident_weight
 
     def is_free(self):
         is_free = self.npu_used == 0 and self.cpu_used == 0
@@ -280,9 +341,9 @@ class MemoryModel():
     
     def free(self, size, device):
         if device == Device.NPU:
-            if self.npu_used - size < self.weight:
+            if self.npu_used - size < self.resident_weight:
                 raise RuntimeError(
-                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to free {size / MB_TO_BYTE:.2f}MB but only {(self.npu_used - self.weight) / MB_TO_BYTE:.2f}MB is used."
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to free {size / MB_TO_BYTE:.2f}MB but only {(self.npu_used - self.resident_weight) / MB_TO_BYTE:.2f}MB is used."
                 )
             self.logger.info(
                 "NPU: used: %.2fMB remove: %.2fMB after: %.2fMB",
@@ -662,15 +723,12 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
     for the KV cache regardless of weight dtype.
     """
     config = get_config(model)
-    n_embd = config['hidden_size']
-    n_head = config['num_attention_heads']
-    head_dim = config.get('head_dim', n_embd // n_head)
-    kv_head = config.get('num_key_value_heads', n_head)
-    kv_dim = kv_head * head_dim
+    attention_dims = _attention_dims(config)
+    kv_dim = attention_dims["kv_cache_dim"]
     n_layer = config['num_hidden_layers']
     kv_fp = 1 if kv_cache_dtype == 'fp8' else fp // 8
-    # 2 (K + V) * kv_dim * n_layer * bytes_per_elem
-    return 2 * kv_dim * n_layer * kv_fp
+    kv_factor = 1 if attention_dims["is_mla"] else 2
+    return kv_factor * kv_dim * n_layer * kv_fp
 
 
 # calculate the per-rank input, weight, output size of each layer
@@ -684,11 +742,14 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     config = get_config(model)
     n_embd = config['hidden_size']
     n_head = config['num_attention_heads']
-    head_dim = config.get('head_dim', n_embd // n_head)
+    attention_dims = _attention_dims(config)
+    head_dim = attention_dims["head_dim"]
     vocab_size = config['vocab_size']
-    kv_head = config.get("num_key_value_heads", n_head)  # fallback to n_head if not defined
-    q_dim = n_head * head_dim       # total Q projection output dim
-    kv_dim = kv_head * head_dim     # total KV projection output dim
+    kv_head = attention_dims["kv_head"]
+    q_dim = attention_dims["q_dim"]
+    v_dim = attention_dims["v_dim"]
+    kv_dim = attention_dims["kv_cache_dim"]
+    is_mla = attention_dims["is_mla"]
     ffn_dim = config.get("intermediate_size", config.get("ffn_dim"))  # dense FFN dim
     moe_ffn_dim = config.get("moe_intermediate_size", ffn_dim)  # per-expert FFN dim (may differ from dense)
     # Same both-name fallback as MemoryModel.__init__ — HF / Qwen use
@@ -696,6 +757,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     num_local_experts = config.get(
         "num_local_experts", config.get("num_experts", 1)
     )
+    num_shared_experts = int(config.get("n_shared_experts", 0) or 0)
 
     p = max(int(parallel), 1)
 
@@ -725,35 +787,70 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
 
     # ----------------- RoPE & Attention Core -----------------
     elif layer_name == "rotary_emb":
-        input_size = ((n_head // p) + (kv_head // p)) * length * head_dim * fp
+        if is_mla:
+            rope_dim = attention_dims["qk_rope_head_dim"]
+            input_size = ((n_head // p) + 1) * length * rope_dim * fp
+        else:
+            input_size = ((n_head // p) + (kv_head // p)) * length * head_dim * fp
         weight_size = 0
-        output_size = ((n_head // p) + (kv_head // p)) * length * head_dim * fp
+        output_size = input_size
 
     elif layer_name == "attention":
-        if not pim:
+        if is_mla:
+            effective_len = 1 if pim else length
+            effective_kv_len = 1 if pim else kv_len
             input_size = (
-                (n_head // p) * length * head_dim * fp +
-                (kv_head // p) * kv_len * head_dim * fp * 2
+                (n_head // p) * effective_len * head_dim * fp +
+                effective_kv_len * kv_dim * fp
             )
             weight_size = 0
-            output_size = (n_head // p) * length * head_dim * fp
+            output_size = (v_dim // p) * effective_len * fp
         else:
-            input_size = (
-                (n_head // p) * 1 * head_dim * fp +
-                (kv_head // p) * 1 * head_dim * fp * 2
-            )
+            if not pim:
+                input_size = (
+                    (n_head // p) * length * head_dim * fp +
+                    (kv_head // p) * kv_len * head_dim * fp * 2
+                )
+                output_size = (n_head // p) * length * head_dim * fp
+            else:
+                input_size = (
+                    (n_head // p) * 1 * head_dim * fp +
+                    (kv_head // p) * 1 * head_dim * fp * 2
+                )
+                output_size = (n_head // p) * 1 * head_dim * fp
             weight_size = 0
-            output_size = (n_head // p) * 1 * head_dim * fp
 
     # ----------------- QKV Projection (fused) -----------------
     elif layer_name == "qkv_proj":
         input_size = length * n_embd * fp
-        weight_size = n_embd * ((q_dim + 2 * kv_dim) // p) * fp
-        output_size = length * ((q_dim + 2 * kv_dim) // p) * fp
+        if is_mla:
+            q_lora_rank = attention_dims["q_lora_rank"]
+            kv_lora_rank = attention_dims["kv_lora_rank"]
+            qk_rope_head_dim = attention_dims["qk_rope_head_dim"]
+            qk_nope_head_dim = attention_dims["qk_nope_head_dim"]
+            v_head_dim = attention_dims["v_head_dim"]
+            if q_lora_rank is None:
+                q_weight = n_embd * (q_dim // p)
+                q_output = q_dim // p
+                norm_weight = kv_lora_rank * fp
+            else:
+                q_lora_rank = int(q_lora_rank)
+                q_weight = n_embd * q_lora_rank + q_lora_rank * (q_dim // p)
+                q_output = q_dim // p
+                norm_weight = (q_lora_rank + kv_lora_rank) * fp
+            kv_a_weight = n_embd * (kv_lora_rank + qk_rope_head_dim)
+            kv_b_output = (n_head * (qk_nope_head_dim + v_head_dim)) // p
+            kv_b_weight = kv_lora_rank * kv_b_output
+            weight_size = (q_weight + kv_a_weight + kv_b_weight) * fp + norm_weight
+            output_size = length * (q_output + kv_dim + kv_b_output) * fp
+        else:
+            weight_size = n_embd * ((q_dim + 2 * kv_dim) // p) * fp
+            output_size = length * ((q_dim + 2 * kv_dim) // p) * fp
 
     elif layer_name == "o_proj":
-        input_size = length * (q_dim // p) * fp
-        weight_size = (q_dim // p) * n_embd * fp
+        input_dim = v_dim if is_mla else q_dim
+        input_size = length * (input_dim // p) * fp
+        weight_size = (input_dim // p) * n_embd * fp
         output_size = length * n_embd * fp
 
     elif layer_name == "gate_up_proj":
@@ -781,6 +878,8 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         input_size = length * n_embd * fp
         weight_size = (n_embd * num_local_experts * fp  # gate (replicated)
                      + experts_per_rank * 3 * n_embd * moe_ffn_dim * fp)  # local experts
+        if num_shared_experts > 0:
+            weight_size += num_shared_experts * 3 * n_embd * moe_ffn_dim * fp
         output_size = length * n_embd * fp
 
     # ----------------- LM Head -----------------
