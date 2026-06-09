@@ -121,7 +121,7 @@ def _prefix_storage_device(name: str | None):
 
 
 def _request_snapshot(req, scheduled_tokens: dict[int, int]) -> dict[str, object]:
-    return {
+    payload = {
         "id": int(req.id),
         "model": req.model,
         "input_tokens": int(req.original_input),
@@ -139,6 +139,16 @@ def _request_snapshot(req, scheduled_tokens: dict[int, int]) -> dict[str, object
         "session_id": getattr(req, "session_id", None),
         "sub_request_index": getattr(req, "sub_request_index", None),
     }
+    for name in (
+        "hbframe_prefill_source_instance_id",
+        "hbframe_prefill_batch_id",
+        "hbframe_prefill_done_ns",
+        "hbframe_handoff_ready_ns",
+        "hbframe_handoff_policy",
+    ):
+        if hasattr(req, name):
+            payload[name] = getattr(req, name)
+    return payload
 
 
 def snapshot_batch(batch, scheduler: Scheduler) -> HBFrameBatchSnapshot:
@@ -351,8 +361,11 @@ class HBFrameServingFrontend:
             original_arrival = int(getattr(req, "hbframe_original_arrival", req.arrival))
             req.hbframe_original_arrival = original_arrival
             req.hbframe_prefill_ttft = int(req.ttft)
+            req.hbframe_prefill_source_instance_id = int(from_instance_id)
+            req.hbframe_prefill_batch_id = int(batch_id)
             req.hbframe_prefill_done_ns = int(completion_time_ns)
             req.hbframe_handoff_ready_ns = int(ready_time_ns)
+            req.hbframe_handoff_policy = self.config.pd_handoff_policy
             req.arrival = int(ready_time_ns)
             decode_scheduler.add_decode(req)
             decode_scheduler.request.sort(key=lambda item: (item.arrival, item.id))
