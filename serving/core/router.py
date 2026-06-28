@@ -10,6 +10,7 @@ class Router:
             num_instances,
             schedulers, req_num,
             routing_policy="RR",
+            prefix_cache_mode="manual",
             seed=42
     ):
         self.schedulers = schedulers
@@ -20,6 +21,7 @@ class Router:
         self.decode_instances = len(self.decode_schedulers)
         self.req_num = req_num
         self.routing_policy = routing_policy.upper()
+        self.prefix_cache_mode = str(prefix_cache_mode or "manual").lower()
         self.seed = seed
         self._rnd = random.Random(seed) if seed is not None else random
         self.prefill_rr_counter = 0
@@ -48,6 +50,17 @@ class Router:
             raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
                              "Supported: RR, RAND, LOAD, CUSTOM")
         self.logger = get_logger(self.__class__)
+
+    def _declared_prefix_hit(self, row, input_toks):
+        if self.prefix_cache_mode == "none":
+            return 0
+        return max(0, min(int(row.get('prefix_cache_hit', 0) or 0), int(input_toks)))
+
+    def _session_auto_prefix_hit(self, row, input_toks, session):
+        explicit = self._declared_prefix_hit(row, input_toks)
+        if explicit > 0 or self.prefix_cache_mode != "session_auto":
+            return explicit
+        return max(0, min(int(session.get('reusable_prefix_tokens', 0) or 0), int(input_toks)))
 
     # -----------------------------------------------------------------------
     # Instance selection policies
@@ -146,6 +159,7 @@ class Router:
             'output_toks': int(row['input_toks'] + row['output_toks']),
             'arrival_time_ns': int(row['arrival_time_ns']),
         }
+        req_data['prefix_cache_hit'] = self._declared_prefix_hit(row, req_data['input_toks'])
         if enable_prefix_caching:
             req_data['input_hash_ids'] = row.get('input_tok_ids', [])
             req_data['output_hash_ids'] = row.get('output_tok_ids', [])
@@ -166,7 +180,9 @@ class Router:
             'sub_requests': sub_reqs,
             'next_index': 1,  # index 0 is being queued now
             'id_base': base_id,
+            'reusable_prefix_tokens': 0,
         }
+        session = self._deferred_sessions[session_id]
 
         # Queue the first sub-request
         first = sub_reqs[0]
@@ -178,6 +194,7 @@ class Router:
             'session_id': session_id,
             'sub_request_index': 0,
         }
+        req_data['prefix_cache_hit'] = self._session_auto_prefix_hit(first, req_data['input_toks'], session)
         if enable_prefix_caching:
             req_data['input_hash_ids'] = first.get('input_tok_ids', [])
             req_data['output_hash_ids'] = first.get('output_tok_ids', [])
@@ -202,18 +219,21 @@ class Router:
             sched = self.prefill_schedulers[instance_id]
 
             if sched.enable_prefix_caching:
-                sched.add_request([
+                new_req = sched.add_request([
                     req_data['index'], sched.model,
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], sched.instance_id,
                     req_data.get('input_hash_ids', []), req_data.get('output_hash_ids', []),
+                    req_data.get('prefix_cache_hit', 0),
                 ], is_init=self._is_init)
             else:
-                sched.add_request([
+                new_req = sched.add_request([
                     req_data['index'], sched.model,
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], sched.instance_id,
                 ], is_init=self._is_init)
+            new_req.session_id = req_data.get('session_id')
+            new_req.sub_request_index = req_data.get('sub_request_index')
 
             self._pending_idx += 1
             routed += 1
@@ -253,7 +273,12 @@ class Router:
         base_id = session['id_base']
 
         # Get tool duration from the completed sub-request
-        tool_duration_ns = int(sub_reqs[completed_idx].get('tool_duration_ns', 0))
+        completed_sub = sub_reqs[completed_idx]
+        session['reusable_prefix_tokens'] = max(
+            0,
+            int(completed_sub.get('input_toks', 0) or 0) + int(completed_sub.get('output_toks', 0) or 0),
+        )
+        tool_duration_ns = int(completed_sub.get('tool_duration_ns', 0))
         release_time_ns = completion_time_ns + tool_duration_ns
 
         if next_idx < len(sub_reqs):
@@ -268,6 +293,7 @@ class Router:
                 'session_id': session_id,
                 'sub_request_index': next_idx,
             }
+            req_data['prefix_cache_hit'] = self._session_auto_prefix_hit(next_sub, req_data['input_toks'], session)
             if self._enable_prefix_caching:
                 req_data['input_hash_ids'] = next_sub.get('input_tok_ids', [])
                 req_data['output_hash_ids'] = next_sub.get('output_tok_ids', [])

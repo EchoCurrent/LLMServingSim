@@ -573,9 +573,12 @@ class MemoryModel():
     def prefix_match(self, req): # req.prefix_cache_hit initialization 
         if not self.enable_prefix_caching:
             return
+        declared_hit = max(0, int(getattr(req, "declared_prefix_cache_hit", 0) or 0))
         
         tokens = req.input_hash_ids
         if tokens is None:
+            req.storage_cache_hit = max(int(getattr(req, "storage_cache_hit", 0) or 0), declared_hit)
+            req.prefix_cache_hit = max(int(getattr(req, "npu_cache_hit", 0) or 0), req.storage_cache_hit)
             return
         old_node = req.npu_last_node
         res = self.npu_prefix_cache.match_prefix(tokens[:req.input])
@@ -585,10 +588,10 @@ class MemoryModel():
 
         if self.prefix_storage is not None:
             res_storage = self.second_tier_prefix_cache.match_prefix(tokens[:req.input])
-            req.storage_cache_hit = res_storage.hit_length
+            req.storage_cache_hit = max(res_storage.hit_length, declared_hit)
             req.storage_last_node = res_storage.last_device_node
         else:
-            req.storage_cache_hit = 0
+            req.storage_cache_hit = declared_hit
             req.storage_last_node = None
         
         req.prefix_cache_hit = max(req.npu_cache_hit, req.storage_cache_hit)

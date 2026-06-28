@@ -895,7 +895,7 @@ class Scheduler:
         new_req = Request(*(req), is_init=is_init)
         # Maintain arrival-time sort order (required by schedule_base/schedule_with_prefix)
         bisect.insort(self.request, new_req, key=lambda r: (r.arrival, r.id))
-        return
+        return new_req
     
     # add decode request to decode instance from prefill instnace
     def add_decode(self, req):

@@ -52,6 +52,7 @@ class HBFrameFrontendConfig:
     enable_prefix_sharing: bool = False
     enable_chunked_prefill: bool = True
     prefix_storage: str | None = None
+    prefix_cache_mode: str = "manual"
     request_routing_policy: str = "LOAD"
     is_init: bool = True
     req_num: int = 0
@@ -262,6 +263,7 @@ class HBFrameServingFrontend:
             self.schedulers,
             config.req_num,
             routing_policy=config.request_routing_policy,
+            prefix_cache_mode=config.prefix_cache_mode,
         )
         self.current_time_ns = 0
         self._active_batches: dict[tuple[int, int], object] = {}

@@ -1,6 +1,6 @@
 # class that manages request of astra-sim
 class Request:
-    def __init__(self, id, model, input, output, arrival, instance_id, input_hash_ids=None, output_hash_ids=None, is_init=True):
+    def __init__(self, id, model, input, output, arrival, instance_id, input_hash_ids=None, output_hash_ids=None, declared_prefix_cache_hit=0, is_init=True):
         self.id = id
         self.model = model
         self.input = input  # Always keep original input length
@@ -25,9 +25,10 @@ class Request:
         # For prefix caching modeling
         self.input_hash_ids = input_hash_ids
         self.output_hash_ids = output_hash_ids
-        self.prefix_cache_hit = 0
+        self.declared_prefix_cache_hit = max(0, min(int(declared_prefix_cache_hit or 0), int(input)))
         self.npu_cache_hit = 0
-        self.storage_cache_hit = 0
+        self.storage_cache_hit = self.declared_prefix_cache_hit
+        self.prefix_cache_hit = max(self.npu_cache_hit, self.storage_cache_hit)
         self.npu_last_node = None
         self.cpu_last_node = None
         self.storage_last_node = None
