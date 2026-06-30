@@ -137,6 +137,9 @@ def _request_snapshot(req, scheduled_tokens: dict[int, int]) -> dict[str, object
         "prefix_cache_hit": int(getattr(req, "prefix_cache_hit", 0)),
         "npu_cache_hit": int(getattr(req, "npu_cache_hit", 0)),
         "storage_cache_hit": int(getattr(req, "storage_cache_hit", 0)),
+        "prefix_cache_source_request_id": getattr(req, "prefix_cache_source_request_id", None),
+        "prefix_cache_source_token_start": int(getattr(req, "prefix_cache_source_token_start", 0) or 0),
+        "prefix_cache_source_token_count": int(getattr(req, "prefix_cache_source_token_count", 0) or 0),
         "session_id": getattr(req, "session_id", None),
         "sub_request_index": getattr(req, "sub_request_index", None),
     }

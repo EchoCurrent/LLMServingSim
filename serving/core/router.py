@@ -62,6 +62,26 @@ class Router:
             return explicit
         return max(0, min(int(session.get('reusable_prefix_tokens', 0) or 0), int(input_toks)))
 
+    def _attach_prefix_source_metadata(self, req_data, row, *, default_source_request_id=None):
+        hit = max(0, int(req_data.get('prefix_cache_hit', 0) or 0))
+        if hit <= 0:
+            return
+        source_id = row.get('prefix_cache_source_request_id', default_source_request_id)
+        if source_id is None:
+            return
+        req_data['prefix_cache_source_request_id'] = int(source_id)
+        req_data['prefix_cache_source_token_start'] = max(
+            0,
+            int(row.get('prefix_cache_source_token_start', 0) or 0),
+        )
+        req_data['prefix_cache_source_token_count'] = max(
+            0,
+            min(
+                int(row.get('prefix_cache_source_token_count', hit) or 0),
+                hit,
+            ),
+        )
+
     # -----------------------------------------------------------------------
     # Instance selection policies
     # -----------------------------------------------------------------------
@@ -160,6 +180,7 @@ class Router:
             'arrival_time_ns': int(row['arrival_time_ns']),
         }
         req_data['prefix_cache_hit'] = self._declared_prefix_hit(row, req_data['input_toks'])
+        self._attach_prefix_source_metadata(req_data, row)
         if enable_prefix_caching:
             req_data['input_hash_ids'] = row.get('input_tok_ids', [])
             req_data['output_hash_ids'] = row.get('output_tok_ids', [])
@@ -195,6 +216,7 @@ class Router:
             'sub_request_index': 0,
         }
         req_data['prefix_cache_hit'] = self._session_auto_prefix_hit(first, req_data['input_toks'], session)
+        self._attach_prefix_source_metadata(req_data, first)
         if enable_prefix_caching:
             req_data['input_hash_ids'] = first.get('input_tok_ids', [])
             req_data['output_hash_ids'] = first.get('output_tok_ids', [])
@@ -234,6 +256,13 @@ class Router:
                 ], is_init=self._is_init)
             new_req.session_id = req_data.get('session_id')
             new_req.sub_request_index = req_data.get('sub_request_index')
+            for name in (
+                'prefix_cache_source_request_id',
+                'prefix_cache_source_token_start',
+                'prefix_cache_source_token_count',
+            ):
+                if name in req_data:
+                    setattr(new_req, name, req_data[name])
 
             self._pending_idx += 1
             routed += 1
@@ -294,6 +323,12 @@ class Router:
                 'sub_request_index': next_idx,
             }
             req_data['prefix_cache_hit'] = self._session_auto_prefix_hit(next_sub, req_data['input_toks'], session)
+            previous_request_id = base_id + completed_idx
+            self._attach_prefix_source_metadata(
+                req_data,
+                next_sub,
+                default_source_request_id=previous_request_id if req_data['prefix_cache_hit'] > 0 else None,
+            )
             if self._enable_prefix_caching:
                 req_data['input_hash_ids'] = next_sub.get('input_tok_ids', [])
                 req_data['output_hash_ids'] = next_sub.get('output_tok_ids', [])
