@@ -25,21 +25,23 @@ calls:
 GateRouter(
     num_local_experts=N,           # total experts in the model
     num_experts_per_token=K,       # top-K activations per token
-    routing_policy='BALANCED',     # one of 4 policies, see below
+    routing_policy='BALANCED',
     seed=42,
     block_copy=True,
 )
 
-result = router.route(num_tokens=T, tp_rank=r, num_experts_per_token=K)
-# → RoutingResult(local_tokens=[...], activated_experts=[...], source_tokens=[...])
+result = router.route_ep(layer_num=L, batch_id=B, total_len=T, ep_size=P)
+# RoutingResult also contains expert_token_counts,
+# source_rank_expert_tokens, and expert_owners.
 ```
 
 `local_tokens[i]` is the number of tokens assigned to EP rank `i`
 after dispatch. `activated_experts[i]` is the count of distinct
 experts touched on that rank. Both feed into the per-rank attention/MLP
-latency lookup.
+latency lookup. `expert_token_counts` and `source_rank_expert_tokens` preserve
+the concrete route for downstream consumers such as HBFrame.
 
-## Four policies
+## Routing policies
 
 ```mermaid
 flowchart LR
@@ -62,14 +64,16 @@ flowchart LR
 | **BALANCED** (default) | Deterministic | Idealized load-balanced gate (post-aux-loss training) | Most research baselines |
 | **RR** | Deterministic | Pure round-robin assignment | Sanity / null-baseline runs |
 | **RAND** | Seeded random | Uniform random per token | Worst-case load imbalance studies |
+| **HASH** | Deterministic | Request/token hash routing | Reproducible token-dependent routing |
+| **HOTSPOT** | Deterministic | A configurable fraction of tokens targets a hot expert pool | Hot-expert and imbalance studies |
+| **REQUEST_AFFINE** | Deterministic | Each request favors a request-local expert pool | Session/request locality studies |
 | **CUSTOM** | Plug-in | Whatever you write | Real trained gate weights, ablation |
 
-### BALANCED, closed-form pigeonhole
+### BALANCED, deterministic uniform routing
 
-BALANCED computes the *exact* token distribution that a perfectly
-load-balanced gate would produce: for `T` tokens and `E` experts with
-top-`K`, each expert gets `T*K/E` tokens (with the remainder split
-deterministically across experts to round to integers).
+BALANCED deterministically spreads each token's top-K assignments across the
+expert space. It approximates the uniform expert load encouraged by auxiliary
+load-balancing losses while retaining the concrete token-to-expert route.
 
 This is what a model with a well-trained auxiliary load-balancing
 loss converges to in expectation. It's the simulator's default
@@ -77,7 +81,7 @@ because:
 
 1. Real production MoE deployments use auxiliary losses → balanced
    distribution is the realistic baseline.
-2. It's deterministic, so simulations are reproducible.
+2. It is deterministic, so simulations are reproducible.
 3. It enables the **block copy** optimization (see below).
 
 ### RR, round-robin

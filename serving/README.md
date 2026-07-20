@@ -105,9 +105,11 @@ Requests are routed at their arrival time during the simulation loop, not upfron
 Handles request transfer in Prefill/Decode disaggregation mode.
 
 ### `gate_function.py`
-Routes tokens to MoE experts according to configurable policies (Copy, Round Robin, Random,
-Custom). `COPY` (default) enables block copy optimization. Provides EP-aware routing via
-`route_ep()` with even expert-to-rank partitioning for per-rank latency lookup.
+Routes tokens to MoE experts using balanced, round-robin, random, hash, hotspot,
+request-affine, or custom policies. Provides EP-aware routing via `route_ep()` with
+even expert-to-rank partitioning plus concrete expert/source-rank token counts. The
+HBFrame export frontend freezes this result in each batch snapshot; HBFrame consumes
+the route and does not make a second expert-routing decision.
 
 ### `memory_model.py`
 Tracks NPU, CPU, and CXL memory usage. Manages KV cache block allocation and the RadixCache

@@ -13,6 +13,7 @@ from pathlib import Path
 import json
 
 from .memory_model import Device
+from .gate_function import GateRouter
 from .router import Router
 from .scheduler import Scheduler
 
@@ -43,6 +44,9 @@ class HBFrameFrontendConfig:
     tp_size: int = 1
     pp_size: int = 1
     ep_size: int = 1
+    expert_routing_policy: str = "BALANCED"
+    moe_hot_expert_fraction: float = 0.125
+    moe_hot_token_fraction: float = 0.8
     instance_id: int = 0
     node_id: int = 0
     start_npu: int = 0
@@ -155,7 +159,7 @@ def _request_snapshot(req, scheduled_tokens: dict[int, int]) -> dict[str, object
     return payload
 
 
-def snapshot_batch(batch, scheduler: Scheduler) -> HBFrameBatchSnapshot:
+def snapshot_batch(batch, scheduler: Scheduler, *, extra_attrs=None) -> HBFrameBatchSnapshot:
     scheduled_tokens = {
         int(key): int(value)
         for key, value in (getattr(batch, "scheduled_tokens", None) or {}).items()
@@ -186,6 +190,7 @@ def snapshot_batch(batch, scheduler: Scheduler) -> HBFrameBatchSnapshot:
             "end": tuple(int(value) for value in batch.end),
             "pd_role": scheduler.pd_type or "colocated",
             "hbframe_scheduler_decision": dict(getattr(scheduler, "_hbframe_last_decision", {}) or {}),
+            **dict(extra_attrs or {}),
         },
     )
 
@@ -201,6 +206,8 @@ class HBFrameServingFrontend:
         self._decode_schedulers = []
         self._pd_handoff_records: list[dict[str, object]] = []
         self._pd_decode_rr_counter = 0
+        self._moe_gate = None
+        self._moe_config = None
 
         def _make_scheduler(index: int, pd_type: str | None, *, start_npu: int | None = None):
             scheduler = Scheduler(
@@ -261,6 +268,24 @@ class HBFrameServingFrontend:
             self._prefill_schedulers = list(self.schedulers)
             self._decode_schedulers = []
         self.scheduler = self.schedulers[0]
+        model_config = self.scheduler.memory.config
+        num_experts = model_config.get(
+            "num_local_experts",
+            model_config.get("num_experts", model_config.get("n_routed_experts")),
+        )
+        if num_experts:
+            self._moe_config = model_config
+            self._moe_gate = GateRouter(
+                config.node_id,
+                config.instance_id,
+                num_experts,
+                num_experts_per_tok=model_config.get("num_experts_per_tok", 1),
+                routing_policy=config.expert_routing_policy,
+                seed=42,
+                block_copy=False,
+                hot_expert_fraction=config.moe_hot_expert_fraction,
+                hot_token_fraction=config.moe_hot_token_fraction,
+            )
         self.router = Router(
             len(self.schedulers),
             self.schedulers,
@@ -311,8 +336,99 @@ class HBFrameServingFrontend:
             if batch is None:
                 continue
             self._active_batches[(int(scheduler.instance_id), int(batch.batch_id))] = batch
-            return snapshot_batch(batch, scheduler)
+            return snapshot_batch(
+                batch,
+                scheduler,
+                extra_attrs=self._moe_execution_for_batch(batch),
+            )
         return None
+
+    def _moe_layer_ids(self):
+        if self._moe_config is None:
+            return ()
+        layer_count = int(self._moe_config.get("num_hidden_layers", 0) or 0)
+        first_dense = int(self._moe_config.get("first_k_dense_replace", 0) or 0)
+        frequency = max(
+            1,
+            int(
+                self._moe_config.get(
+                    "moe_layer_freq",
+                    self._moe_config.get("decoder_sparse_step", 1),
+                )
+                or 1
+            ),
+        )
+        mlp_only_layers = {
+            int(layer_id)
+            for layer_id in (self._moe_config.get("mlp_only_layers", ()) or ())
+        }
+        return tuple(
+            layer_id
+            for layer_id in range(layer_count)
+            if layer_id >= first_dense
+            and ((layer_id - first_dense) % frequency == 0 or layer_id in mlp_only_layers)
+        )
+
+    @staticmethod
+    def _batch_token_identities(batch):
+        identities = []
+        scheduled_tokens = getattr(batch, "scheduled_tokens", None) or {}
+        for request in batch.requests:
+            count = max(0, int(scheduled_tokens.get(request.id, 0) or 0))
+            start = max(0, int(request.num_computed_tokens))
+            identities.extend((int(request.id), start + offset) for offset in range(count))
+        target = max(0, int(batch.total_len))
+        while len(identities) < target:
+            identities.append((int(batch.batch_id), len(identities)))
+        return tuple(identities[:target])
+
+    def _moe_execution_for_batch(self, batch):
+        if self._moe_gate is None:
+            return {}
+        ep_size = max(1, int(self.config.ep_size))
+        token_identities = self._batch_token_identities(batch)
+        layers = {}
+        expert_owners = None
+        for layer_id in self._moe_layer_ids():
+            route = self._moe_gate.route_ep(
+                layer_id,
+                batch.batch_id,
+                batch.total_len,
+                ep_size,
+                token_identities=token_identities,
+            )
+            if expert_owners is None:
+                expert_owners = list(route.expert_owners)
+            layers[str(layer_id)] = {
+                "expert_token_counts": {
+                    str(expert_id): int(count)
+                    for expert_id, count in sorted(route.expert_token_counts.items())
+                    if int(count) > 0
+                },
+                "source_rank_expert_tokens": [
+                    {
+                        str(expert_id): int(count)
+                        for expert_id, count in sorted(rank_counts.items())
+                        if int(count) > 0
+                    }
+                    for rank_counts in route.source_rank_expert_tokens
+                ],
+                "source_tokens": [int(value) for value in route.source_tokens],
+                "local_tokens": [int(value) for value in route.local_tokens],
+                "activated_experts": [int(value) for value in route.activated_experts],
+            }
+        return {
+            "moe_execution": {
+                "schema": "llmservingsim-moe-execution-v1",
+                "routing_source": "llmservingsim_frontend",
+                "routing_policy": str(self.config.expert_routing_policy).lower(),
+                "ep_size": ep_size,
+                "expert_count": int(self._moe_gate.E),
+                "top_k": int(self._moe_gate.k),
+                "expert_owners": expert_owners or [],
+                "layers": layers,
+            }
+        }
 
     def complete_batch(self, batch_id: int, completion_time_ns: int, instance_id: int | None = None) -> tuple[dict[str, object], ...]:
         """Mark a scheduled batch complete and return newly finished requests."""
