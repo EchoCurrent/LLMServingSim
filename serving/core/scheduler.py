@@ -1,5 +1,5 @@
 import bisect
-import pandas as pd
+from statistics import fmean, median
 from time import time
 import csv
 
@@ -11,7 +11,6 @@ from .graph_generator import *
 from .trace_generator import *
 from .logger import print_markup, print_rule
 from .pim_model import *
-import numpy as np
 
 # class that shedules request of astra-sim
 class Scheduler:
@@ -956,9 +955,18 @@ class Scheduler:
             if not values:
                 print_markup(f"No {title.split()[0]} data available")
                 return
-            mean = np.mean(values) / 1_000_000
-            median = np.median(values) / 1_000_000
-            p99 = np.percentile(values, 99) / 1_000_000
+            ordered = sorted(values)
+            percentile_rank = (len(ordered) - 1) * 0.99
+            lower_index = int(percentile_rank)
+            upper_index = min(lower_index + 1, len(ordered) - 1)
+            fraction = percentile_rank - lower_index
+            p99_value = (
+                ordered[lower_index]
+                + (ordered[upper_index] - ordered[lower_index]) * fraction
+            )
+            mean = fmean(values) / 1_000_000
+            median_value = median(values) / 1_000_000
+            p99 = p99_value / 1_000_000
             label = title.split()[-1] if title != "Time to First Token" else "TTFT"
             # Map to the metric short-name used in the detail rows.
             short = {
@@ -968,7 +976,7 @@ class Scheduler:
             }[title]
             spacing = " " * num_space
             print_markup(f"Mean {short} (ms){spacing}:                                                     {mean:.2f}")
-            print_markup(f"Median {short} (ms){spacing}:                                                   {median:.2f}")
+            print_markup(f"Median {short} (ms){spacing}:                                                   {median_value:.2f}")
             print_markup(f"P99 {short} (ms){spacing}:                                                      {p99:.2f}")
 
         _render("Time to First Token", ttft_values)

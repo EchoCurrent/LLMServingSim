@@ -12,8 +12,6 @@ class Request:
         output_hash_ids=None,
         declared_prefix_cache_hit=0,
         prefix_cache_source_request_id=None,
-        prefix_cache_source_token_start=0,
-        prefix_cache_source_token_count=None,
         is_init=True,
     ):
         self.id = id
@@ -45,10 +43,6 @@ class Request:
         self.storage_cache_hit = self.declared_prefix_cache_hit
         self.prefix_cache_hit = max(self.npu_cache_hit, self.storage_cache_hit)
         self.prefix_cache_source_request_id = None if prefix_cache_source_request_id is None else int(prefix_cache_source_request_id)
-        self.prefix_cache_source_token_start = max(0, int(prefix_cache_source_token_start or 0))
-        if prefix_cache_source_token_count is None:
-            prefix_cache_source_token_count = self.declared_prefix_cache_hit
-        self.prefix_cache_source_token_count = max(0, min(int(prefix_cache_source_token_count or 0), int(input)))
         self.npu_last_node = None
         self.cpu_last_node = None
         self.storage_last_node = None

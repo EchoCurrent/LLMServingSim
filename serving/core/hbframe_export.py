@@ -142,8 +142,6 @@ def _request_snapshot(req, scheduled_tokens: dict[int, int]) -> dict[str, object
         "npu_cache_hit": int(getattr(req, "npu_cache_hit", 0)),
         "storage_cache_hit": int(getattr(req, "storage_cache_hit", 0)),
         "prefix_cache_source_request_id": getattr(req, "prefix_cache_source_request_id", None),
-        "prefix_cache_source_token_start": int(getattr(req, "prefix_cache_source_token_start", 0) or 0),
-        "prefix_cache_source_token_count": int(getattr(req, "prefix_cache_source_token_count", 0) or 0),
         "session_id": getattr(req, "session_id", None),
         "sub_request_index": getattr(req, "sub_request_index", None),
     }
@@ -295,6 +293,7 @@ class HBFrameServingFrontend:
         )
         self.current_time_ns = 0
         self._active_batches: dict[tuple[int, int], object] = {}
+        self._initial_requests: list[dict[str, object]] = []
 
     @property
     def pd_disaggregated(self) -> bool:
@@ -311,18 +310,65 @@ class HBFrameServingFrontend:
 
         self.router._enable_prefix_caching = self.config.enable_prefix_caching
         self.router._is_init = self.config.is_init
-        loaded_lines = 0
+        loaded_requests = 0
         with open(path, "r", encoding="utf-8") as handle:
             for line in handle:
-                if self.config.req_num > 0 and loaded_lines >= self.config.req_num:
-                    break
+                if not line.strip():
+                    continue
                 row = json.loads(line)
+                if bool(row.get("initialize_only", False)):
+                    self._load_initial_request(row)
+                    continue
+                if self.config.req_num > 0 and loaded_requests >= self.config.req_num:
+                    continue
                 if "sub_requests" in row:
                     self.router._load_agentic_session(row, self.config.enable_prefix_caching)
                 else:
                     self.router._load_flat_request(row, self.config.enable_prefix_caching)
-                loaded_lines += 1
+                loaded_requests += 1
         self.router._pending_requests.sort(key=lambda request: request["arrival_time_ns"])
+
+    def _load_initial_request(self, row: dict[str, object]) -> None:
+        """Reserve and normalize one historical request without scheduling it."""
+        if "sub_requests" in row:
+            raise ValueError("initialize_only requests must use the flat workload format")
+        if row.get("request_id") is None:
+            raise ValueError("initialize_only requests require an explicit request_id")
+        request_id = self.router._allocate_request_id(row["request_id"])
+        input_tokens = int(row["input_toks"])
+        output_tokens = int(row.get("output_toks", 0) or 0)
+        prefix_hit = max(0, int(row.get("prefix_cache_hit", 0) or 0))
+        if input_tokens < 0 or output_tokens < 0:
+            raise ValueError(
+                f"initialize_only request {request_id} requires non-negative input_toks and output_toks"
+            )
+        if prefix_hit > input_tokens:
+            raise ValueError(
+                f"initialize_only request {request_id} prefix_cache_hit={prefix_hit} "
+                f"exceeds input_toks={input_tokens}"
+            )
+        source_request_id = row.get("prefix_cache_source_request_id")
+        if prefix_hit > 0 and source_request_id is None:
+            raise ValueError(
+                f"initialize_only request {request_id} declares prefix_cache_hit={prefix_hit} "
+                "but has no prefix_cache_source_request_id"
+            )
+        normalized: dict[str, object] = {
+            "request_id": request_id,
+            "session_id": row.get("session_id"),
+            "input_toks": input_tokens,
+            "output_toks": output_tokens,
+            "prefix_cache_hit": prefix_hit,
+            "initialize_only": True,
+        }
+        if source_request_id is not None:
+            normalized["prefix_cache_source_request_id"] = int(source_request_id)
+        self._initial_requests.append(normalized)
+
+    @property
+    def initial_requests(self) -> tuple[dict[str, object], ...]:
+        """Historical requests to materialize before the serving timeline starts."""
+        return tuple(dict(request) for request in self._initial_requests)
 
     def route_arrivals(self, current_time_ns: int) -> int:
         self.current_time_ns = int(current_time_ns)

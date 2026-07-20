@@ -2,7 +2,6 @@ import os
 import re
 from .request import *
 from .utils import *
-import pandas as pd
 import yaml
 from .memory_model import calculate_sizes
 from .gate_function import GateRouter
@@ -230,6 +229,8 @@ def _read_skew_fit_csv(path):
     """Return (alpha_by_bucket, n_by_bucket) keyed by the pipe-delimited
     bucket string used by ``_skew_alpha``.
     """
+    import pandas as pd
+
     df = pd.read_csv(path)
     alphas: dict = {}
     counts: dict = {}
@@ -260,6 +261,8 @@ def _read_category_csv(path, key_cols):
     """
     if not os.path.isfile(path):
         return None
+    import pandas as pd
+
     df = pd.read_csv(path, sep=",")
     # time_us -> latency_ns (int, min 1)
     df["latency_ns"] = (df["time_us"].astype(float) * 1_000.0).round().astype(int).clip(lower=1)

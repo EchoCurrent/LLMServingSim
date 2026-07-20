@@ -37,6 +37,7 @@ class Router:
         self._deferred_sessions = {}     # session_id -> session state dict
         self._request_to_session = {}    # request_id -> (session_id, sub_request_index)
         self._next_request_id = 0        # monotonic counter for unique request IDs
+        self._allocated_request_ids = set()
 
         if self.routing_policy == "RR":
             self._select_instance = self._rr_select
@@ -56,6 +57,21 @@ class Router:
             return 0
         return max(0, min(int(row.get('prefix_cache_hit', 0) or 0), int(input_toks)))
 
+    def _allocate_request_id(self, explicit_id=None):
+        if explicit_id is None:
+            while self._next_request_id in self._allocated_request_ids:
+                self._next_request_id += 1
+            request_id = self._next_request_id
+        else:
+            request_id = int(explicit_id)
+            if request_id < 0:
+                raise ValueError(f"request_id must be non-negative, got {request_id}")
+        if request_id in self._allocated_request_ids:
+            raise ValueError(f"Duplicate request_id in workload: {request_id}")
+        self._allocated_request_ids.add(request_id)
+        self._next_request_id = max(self._next_request_id, request_id + 1)
+        return request_id
+
     def _session_auto_prefix_hit(self, row, input_toks, session):
         explicit = self._declared_prefix_hit(row, input_toks)
         if explicit > 0 or self.prefix_cache_mode != "session_auto":
@@ -70,17 +86,6 @@ class Router:
         if source_id is None:
             return
         req_data['prefix_cache_source_request_id'] = int(source_id)
-        req_data['prefix_cache_source_token_start'] = max(
-            0,
-            int(row.get('prefix_cache_source_token_start', 0) or 0),
-        )
-        req_data['prefix_cache_source_token_count'] = max(
-            0,
-            min(
-                int(row.get('prefix_cache_source_token_count', hit) or 0),
-                hit,
-            ),
-        )
 
     # -----------------------------------------------------------------------
     # Instance selection policies
@@ -171,8 +176,7 @@ class Router:
 
     def _load_flat_request(self, row, enable_prefix_caching):
         """Load a single flat request into pending queue."""
-        req_id = self._next_request_id
-        self._next_request_id += 1
+        req_id = self._allocate_request_id(row.get('request_id'))
         req_data = {
             'index': req_id,
             'input_toks': int(row['input_toks']),
@@ -192,8 +196,14 @@ class Router:
         if not sub_reqs:
             return 0
         session_id = row.get('session_id', f'session_{self._next_request_id}')
-        base_id = self._next_request_id
-        self._next_request_id += len(sub_reqs)
+        explicit_base_id = row.get('request_id')
+        if explicit_base_id is not None:
+            base_id = self._allocate_request_id(explicit_base_id)
+            for request_id in range(base_id + 1, base_id + len(sub_reqs)):
+                self._allocate_request_id(request_id)
+        else:
+            request_ids = [self._allocate_request_id() for _ in sub_reqs]
+            base_id = request_ids[0]
         arrival_ns = int(row['arrival_time_ns'])
 
         # Store session state for dependency chain
@@ -258,8 +268,6 @@ class Router:
             new_req.sub_request_index = req_data.get('sub_request_index')
             for name in (
                 'prefix_cache_source_request_id',
-                'prefix_cache_source_token_start',
-                'prefix_cache_source_token_count',
             ):
                 if name in req_data:
                     setattr(new_req, name, req_data[name])

@@ -5,7 +5,6 @@ from time import time
 from .request import *
 from .utils import *
 from .logger import get_logger
-import pandas as pd
 
 def convert_value(v: str):
     try:
@@ -146,4 +145,3 @@ class PIMModel:
         slope = attn_model[self.spec_name]["slope"]
         intercept = attn_model[self.spec_name]["intercept"]
         return (slope * L + intercept) / channel_split  # float, ns
-
