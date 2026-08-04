@@ -185,6 +185,9 @@ class Router:
         }
         req_data['prefix_cache_hit'] = self._declared_prefix_hit(row, req_data['input_toks'])
         self._attach_prefix_source_metadata(req_data, row)
+        req_data['resume_from_initialized_context'] = bool(
+            row.get('resume_from_initialized_context', False)
+        )
         if enable_prefix_caching:
             req_data['input_hash_ids'] = row.get('input_tok_ids', [])
             req_data['output_hash_ids'] = row.get('output_tok_ids', [])
@@ -247,8 +250,20 @@ class Router:
             if req_data['arrival_time_ns'] > current_time_ns:
                 break
 
-            instance_id = self._select_instance(self.prefill_schedulers, "prefill")
-            sched = self.prefill_schedulers[instance_id]
+            resume_decode = bool(req_data.get('resume_from_initialized_context', False))
+            if resume_decode and self.decode_schedulers:
+                target_schedulers = self.decode_schedulers
+                routing_role = "decode"
+            else:
+                target_schedulers = self.prefill_schedulers
+                routing_role = "prefill"
+            if not target_schedulers:
+                raise RuntimeError(
+                    "resume_from_initialized_context requires a colocated or decode scheduler"
+                )
+
+            instance_id = self._select_instance(target_schedulers, routing_role)
+            sched = target_schedulers[instance_id]
 
             if sched.enable_prefix_caching:
                 new_req = sched.add_request([
@@ -266,6 +281,10 @@ class Router:
                 ], is_init=self._is_init)
             new_req.session_id = req_data.get('session_id')
             new_req.sub_request_index = req_data.get('sub_request_index')
+            new_req.resume_from_initialized_context = resume_decode
+            if resume_decode:
+                new_req.num_computed_tokens = int(new_req.original_input)
+                new_req._prefix_resolved = True
             for name in (
                 'prefix_cache_source_request_id',
             ):

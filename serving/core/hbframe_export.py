@@ -142,6 +142,9 @@ def _request_snapshot(req, scheduled_tokens: dict[int, int]) -> dict[str, object
         "npu_cache_hit": int(getattr(req, "npu_cache_hit", 0)),
         "storage_cache_hit": int(getattr(req, "storage_cache_hit", 0)),
         "prefix_cache_source_request_id": getattr(req, "prefix_cache_source_request_id", None),
+        "resume_from_initialized_context": bool(
+            getattr(req, "resume_from_initialized_context", False)
+        ),
         "session_id": getattr(req, "session_id", None),
         "sub_request_index": getattr(req, "sub_request_index", None),
     }
@@ -294,6 +297,7 @@ class HBFrameServingFrontend:
         self.current_time_ns = 0
         self._active_batches: dict[tuple[int, int], object] = {}
         self._initial_requests: list[dict[str, object]] = []
+        self._initial_request_ids: set[int] = set()
 
     @property
     def pd_disaggregated(self) -> bool:
@@ -324,9 +328,47 @@ class HBFrameServingFrontend:
                 if "sub_requests" in row:
                     self.router._load_agentic_session(row, self.config.enable_prefix_caching)
                 else:
+                    row = self._annotate_initialized_decode_resume(row)
                     self.router._load_flat_request(row, self.config.enable_prefix_caching)
                 loaded_requests += 1
         self.router._pending_requests.sort(key=lambda request: request["arrival_time_ns"])
+
+    def _annotate_initialized_decode_resume(
+        self,
+        row: dict[str, object],
+    ) -> dict[str, object]:
+        """Mark a full initialized-history continuation as decode-ready."""
+        normalized = dict(row)
+        input_tokens = int(normalized.get("input_toks", 0) or 0)
+        prefix_hit = max(0, int(normalized.get("prefix_cache_hit", 0) or 0))
+        source_id = normalized.get("prefix_cache_source_request_id")
+        source_is_initialized = (
+            source_id is not None and int(source_id) in self._initial_request_ids
+        )
+        explicit = normalized.get("resume_from_initialized_context")
+        if explicit is None:
+            resume = (
+                self.config.enable_prefix_caching
+                and str(self.config.prefix_cache_mode).lower() != "none"
+                and source_is_initialized
+                and input_tokens > 0
+                and prefix_hit == input_tokens
+            )
+        else:
+            resume = bool(explicit)
+        if resume:
+            if not source_is_initialized:
+                raise ValueError(
+                    "resume_from_initialized_context requires "
+                    "prefix_cache_source_request_id to name an initialize_only request"
+                )
+            if input_tokens <= 0 or prefix_hit != input_tokens:
+                raise ValueError(
+                    "resume_from_initialized_context requires "
+                    "prefix_cache_hit == input_toks > 0"
+                )
+        normalized["resume_from_initialized_context"] = resume
+        return normalized
 
     def _load_initial_request(self, row: dict[str, object]) -> None:
         """Reserve and normalize one historical request without scheduling it."""
@@ -364,6 +406,7 @@ class HBFrameServingFrontend:
         if source_request_id is not None:
             normalized["prefix_cache_source_request_id"] = int(source_request_id)
         self._initial_requests.append(normalized)
+        self._initial_request_ids.add(request_id)
 
     @property
     def initial_requests(self) -> tuple[dict[str, object], ...]:
@@ -567,6 +610,7 @@ class HBFrameServingFrontend:
             "latency_ns": latency_ns,
             "ttft_ns": ttft_ns,
             "tpot_ns": int(tpot_ns),
+            "output_tokens": output_tokens,
             "itl_ns": [int(value) for value in req.itl],
             "prompt_tokens_accounted": int(prompt_t),
             "generation_tokens_accounted": int(gen_t),
@@ -595,7 +639,6 @@ class HBFrameServingFrontend:
             {
                 **self._metric_dict(req),
                 "input_tokens": int(req.original_input),
-                "output_tokens": int(req.output),
             }
             for req in sorted((req for scheduler in self.schedulers for req in scheduler.done), key=lambda item: item.id)
         )

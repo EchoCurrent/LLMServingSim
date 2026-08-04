@@ -81,6 +81,43 @@ class Scheduler:
         req.num_computed_tokens = max(int(req.num_computed_tokens), int(getattr(req, "prefix_cache_hit", 0)))
         self._hbframe_last_decision.setdefault("prefix_decisions", []).append(dict(decision))
 
+    def _resolve_new_request_prefix(self, req):
+        """Resolve prefix state before phase classification and token allocation.
+
+        Normal prefix-cache admission retains at least the last prompt token
+        for logits, matching vLLM.  HBFrame initialized decode resumes are
+        marked and initialized by the router and bypass this prompt path.
+        """
+        if not self.enable_prefix_caching or getattr(req, "_prefix_resolved", False):
+            return
+        if getattr(req, "resume_from_initialized_context", False):
+            req.num_computed_tokens = int(req.original_input)
+            req._prefix_resolved = True
+            return
+
+        self.memory.prefix_match(req)
+        self._apply_hbframe_prefix_decision(req)
+
+        max_prompt_hit = max(0, int(req.original_input) - 1)
+        req.npu_cache_hit = min(
+            max(0, int(getattr(req, "npu_cache_hit", 0) or 0)),
+            max_prompt_hit,
+        )
+        req.storage_cache_hit = min(
+            max(0, int(getattr(req, "storage_cache_hit", 0) or 0)),
+            max_prompt_hit,
+        )
+        req.prefix_cache_hit = min(
+            max(
+                int(getattr(req, "prefix_cache_hit", 0) or 0),
+                req.npu_cache_hit,
+                req.storage_cache_hit,
+            ),
+            max_prompt_hit,
+        )
+        req.num_computed_tokens = req.prefix_cache_hit
+        req._prefix_resolved = True
+
     def _choose_hbframe_eviction_victim(self, candidates, required_bytes=0):
         oracle = getattr(self, "hbframe_oracle", None)
         if oracle is None or not hasattr(oracle, "choose_scheduler_eviction"):
@@ -137,6 +174,8 @@ class Scheduler:
 
             # can make batch and proceed
             batch_req = batch_req[:batch_len]
+            for req in batch_req:
+                self._resolve_new_request_prefix(req)
             batch_req = self._filter_by_pd_role(batch_req)
             batch_len = len(batch_req)
             if batch_len == 0:
@@ -409,6 +448,8 @@ class Scheduler:
 
             # can make batch and proceed
             batch_req = batch_req[:batch_len]
+            for req in batch_req:
+                self._resolve_new_request_prefix(req)
             batch_req = self._filter_by_pd_role(batch_req)
             batch_len = len(batch_req)
             if batch_len == 0:
@@ -465,16 +506,14 @@ class Scheduler:
                             break
                         # Calculate remaining tokens without considering prefix cache
                         # because it is already considered in "self.memory.prefix_match(req)" -> req.num_computed_tokens
-                        if req.num_computed_tokens == 0:
-                            self.memory.prefix_match(req)
-                            self._apply_hbframe_prefix_decision(req)
+                        self._resolve_new_request_prefix(req)
                         remaining = req.original_input - req.num_computed_tokens
                         # Per-request cap: long_prefill_token_threshold
                         if 0 < threshold < remaining:
                             remaining = threshold
                         chunk = min(remaining, token_budget)
                         if chunk <= 0:
-                            break
+                            continue
 
                         req.chunk_len = chunk
                         new_batch_req.append(req)
@@ -488,9 +527,7 @@ class Scheduler:
                 total_len = 0
                 for req in batch_req:
                     if req.is_prefill():
-                        if req.num_computed_tokens == 0:
-                            self.memory.prefix_match(req)
-                            self._apply_hbframe_prefix_decision(req)
+                        self._resolve_new_request_prefix(req)
                         # Consider prefix cache hit for non-chunked prefill
                         prefix_hit = req.prefix_cache_hit
                         tokens_to_compute = max(req.original_input - prefix_hit, 1)

@@ -49,6 +49,11 @@ class Request:
 
         # For prefix cache lock tracking
         self._prefix_locked = False
+        self._prefix_resolved = False
+
+        # An HBFrame initialize_only history can restore an already-active
+        # sequence directly at its next decode token.
+        self.resume_from_initialized_context = False
 
         # For agentic session tracking (informational, does not drive scheduling)
         self.session_id = None
