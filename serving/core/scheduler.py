@@ -183,6 +183,7 @@ class Scheduler:
 
             kv_size = 0
             evict_size = 0
+            logical_pool_transfers = []
 
             # Get decode requests for preemption decisions
             gen_req = [req for req in batch_req if not req.is_prefill()]
@@ -296,7 +297,16 @@ class Scheduler:
                 victim = self._choose_hbframe_eviction_victim(gen_req, kv_size)
                 if victim is None:
                     return None
-                evict_size += self.memory.get_evict_kv(victim)
+                victim_size = self.memory.get_evict_kv(victim)
+                evict_size += victim_size
+                logical_pool_transfers.append({
+                    "request_id": int(victim.id),
+                    "source_pool": "L1",
+                    "target_pool": "L2",
+                    "size_bytes": int(victim_size),
+                    "size_scope": "per_rank",
+                    "reason": "scheduler_evict",
+                })
                 victim.evict = True
                 self.logger.info("Eviction of the request #%d", victim.id)
                 gen_req = [req for req in gen_req if req.id != victim.id]
@@ -305,8 +315,8 @@ class Scheduler:
                 # bytes; cpu_used is tracked in full-cluster bytes (matches
                 # MemoryModel.apply_kv_cache_events convention), so scale by
                 # num_npus when crossing the NPU->CPU boundary.
-                self.memory.free(evict_size, Device.NPU)
-                self.memory.allocate(evict_size * self.num_npus, Device.CPU)
+                self.memory.free(victim_size, Device.NPU)
+                self.memory.allocate(victim_size * self.num_npus, Device.CPU)
 
                 if len(gen_req) < batch_len:
                     batch_len = len(gen_req)
@@ -334,7 +344,16 @@ class Scheduler:
 
                 if req.evict:
                     # load evicted kv cache
-                    load_size += self.memory.get_evict_kv(req)
+                    request_load_size = self.memory.get_evict_kv(req)
+                    load_size += request_load_size
+                    logical_pool_transfers.append({
+                        "request_id": int(req.id),
+                        "source_pool": "L2",
+                        "target_pool": "L1",
+                        "size_bytes": int(request_load_size),
+                        "size_scope": "per_rank",
+                        "reason": "scheduler_load",
+                    })
                     req.evict = False
                     self.logger.info("Loading the request #%d", req.id)
 
@@ -384,10 +403,21 @@ class Scheduler:
 
             # make batch, output doesn't matter here!! always one iteration
             # batch is also 1
-            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, load_size)
+            committed_evict_bytes = sum(
+                int(item["size_bytes"])
+                for item in logical_pool_transfers
+                if item["source_pool"] == "L1" and item["target_pool"] == "L2"
+            )
+            committed_load_bytes = sum(
+                int(item["size_bytes"])
+                for item in logical_pool_transfers
+                if item["source_pool"] == "L2" and item["target_pool"] == "L1"
+            )
+            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, committed_evict_bytes, committed_load_bytes)
             # add already fired system
             batch.fired.append(sys)
             batch.requests.extend(batch_req)
+            batch.logical_pool_transfers = logical_pool_transfers
             self.inflight.append(batch)
             self.logger.info(
                 "Scheduling new batch #%d to NPU[%d]",
@@ -562,6 +592,7 @@ class Scheduler:
             # ============ STEP 2: KV size calculation ============
             kv_size = 0
             evict_size = 0
+            logical_pool_transfers = []
             temp_len = batch_len
             total_useable_size = self.memory.avail_size(Device.NPU) + self.memory.evictable_size(Device.NPU)
             
@@ -606,6 +637,14 @@ class Scheduler:
                 
                 victim.evict = True
                 evicted_req.append(victim)
+                logical_pool_transfers.append({
+                    "request_id": int(victim.id),
+                    "source_pool": "L1",
+                    "target_pool": "L2",
+                    "size_bytes": int(self.memory.get_evict_kv(victim)),
+                    "size_scope": "per_rank",
+                    "reason": "scheduler_evict",
+                })
                 self.logger.info("Eviction of the request #%d", victim.id)
                 gen_req = [req for req in gen_req if req.id != victim.id]
                 batch_req = [req for req in batch_req if req.id != victim.id]
@@ -650,7 +689,19 @@ class Scheduler:
 
                 # Load prefix cache from storage if needed
                 if req.is_prefill() and req.storage_cache_hit > req.prefix_cache_hit:
-                    prefix_load_size += (req.storage_cache_hit - req.prefix_cache_hit) * self.memory.get_kv(1)
+                    request_prefix_load_size = (
+                        (req.storage_cache_hit - req.prefix_cache_hit)
+                        * self.memory.get_kv(1)
+                    )
+                    prefix_load_size += request_prefix_load_size
+                    logical_pool_transfers.append({
+                        "request_id": int(req.id),
+                        "source_pool": "L2",
+                        "target_pool": "L1",
+                        "size_bytes": int(request_prefix_load_size),
+                        "size_scope": "per_rank",
+                        "reason": "prefix_load",
+                    })
 
                 # Handle evicted requests
                 if req.evict:
@@ -659,7 +710,16 @@ class Scheduler:
                     self.memory.lock_prefix(req, Device.NPU)
                     if self.prefix_storage is not None:
                         self.memory.unlock_prefix(req, Device.CPU)
-                    evict_load_size += self.memory.get_evict_kv(req)
+                    request_load_size = self.memory.get_evict_kv(req)
+                    evict_load_size += request_load_size
+                    logical_pool_transfers.append({
+                        "request_id": int(req.id),
+                        "source_pool": "L2",
+                        "target_pool": "L1",
+                        "size_bytes": int(request_load_size),
+                        "size_scope": "per_rank",
+                        "reason": "scheduler_load",
+                    })
                     req.evict = False
                     self.logger.info("Loading the request #%d", req.id)
 
@@ -731,9 +791,20 @@ class Scheduler:
             # For debugging
             # self.memory.npu_prefix_cache.pretty_print()
             # self.memory.npu_prefix_cache.print_prefix_info()
-            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, evict_load_size + prefix_load_size)
+            committed_evict_bytes = sum(
+                int(item["size_bytes"])
+                for item in logical_pool_transfers
+                if item["source_pool"] == "L1" and item["target_pool"] == "L2"
+            )
+            committed_load_bytes = sum(
+                int(item["size_bytes"])
+                for item in logical_pool_transfers
+                if item["source_pool"] == "L2" and item["target_pool"] == "L1"
+            )
+            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, committed_evict_bytes, committed_load_bytes)
             batch.fired.append(sys)
             batch.requests.extend(batch_req)
+            batch.logical_pool_transfers = logical_pool_transfers
             self.inflight.append(batch)
             self.logger.info(
                 "Scheduling new batch #%d to NPU[%d]",

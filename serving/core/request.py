@@ -116,6 +116,10 @@ class Batch:
 
         # for debugging
         self.scheduled_tokens = None
+        # Frontend-owned logical L1/L2 transitions committed while constructing
+        # this batch.  HBFrame executes these decisions physically; it must not
+        # choose a different request to move between pools.
+        self.logical_pool_transfers = []
     def log(self):
         print("-------------------------Batch Log------------------------")
         for key in self.__dict__.keys():

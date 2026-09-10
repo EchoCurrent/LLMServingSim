@@ -126,11 +126,12 @@ def _prefix_storage_device(name: str | None):
 
 
 def _request_snapshot(req, scheduled_tokens: dict[int, int]) -> dict[str, object]:
+    """Export generated-token count, not Request.output's total sequence limit."""
     payload = {
         "id": int(req.id),
         "model": req.model,
         "input_tokens": int(req.original_input),
-        "output_tokens": int(req.output),
+        "output_tokens": max(0, int(req.output) - int(req.original_input)),
         "arrival_time_ns": int(req.arrival),
         "instance_id": int(req.instance_id),
         "is_init": bool(req.is_init),
@@ -191,6 +192,27 @@ def snapshot_batch(batch, scheduler: Scheduler, *, extra_attrs=None) -> HBFrameB
             "end": tuple(int(value) for value in batch.end),
             "pd_role": scheduler.pd_type or "colocated",
             "hbframe_scheduler_decision": dict(getattr(scheduler, "_hbframe_last_decision", {}) or {}),
+            "logical_memory": {
+                "schema": "hbframe-logical-memory-v1",
+                "pools": {
+                    "L1": {
+                        "capacity_bytes": int(scheduler.memory.npu_mem),
+                        "used_bytes": int(scheduler.memory.npu_used),
+                        "reserved_bytes": 0,
+                        "scope": "per_rank",
+                    },
+                    "L2": {
+                        "capacity_bytes": int(scheduler.memory.cpu_mem),
+                        "used_bytes": int(scheduler.memory.cpu_used),
+                        "reserved_bytes": 0,
+                        "scope": "node",
+                    },
+                },
+                "transfers": tuple(
+                    dict(item)
+                    for item in getattr(batch, "logical_pool_transfers", ())
+                ),
+            },
             **dict(extra_attrs or {}),
         },
     )
