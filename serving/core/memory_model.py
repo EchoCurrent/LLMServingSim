@@ -58,7 +58,7 @@ class Device(Enum):
     CXL = 3
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', weight_residency='npu'):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', weight_residency='npu', l2_retains_l1=False, l2_scope='node'):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -75,6 +75,10 @@ class MemoryModel():
         self.enable_prefix_caching = enable_prefix_caching
         self.enable_prefix_sharing = enable_prefix_sharing
         self.prefix_storage = prefix_storage
+        self.l2_retains_l1 = bool(l2_retains_l1)
+        self.l2_scope = str(l2_scope)
+        self._l1_request_bytes = {}
+        self._l2_request_bytes = {}
 
         self.config = get_config(model)
         self.n_embd = self.config['hidden_size']
@@ -148,6 +152,105 @@ class MemoryModel():
         self._npu_cache_hashtolen = {}
         self._cpu_cache_hashtolen = {}
         self._bytes_per_token = self.get_kv(1)  # bytes per token for kv cache
+
+    @property
+    def _l2_size_scale(self):
+        return 1 if self.l2_scope == 'per_rank' else self.num_npus
+
+    def reserve_logical_batch(self, requests, scheduled_tokens):
+        """Reserve inclusive L2 backing and record active L1 membership."""
+        if not self.l2_retains_l1:
+            return
+        updates = []
+        added_l2 = 0
+        for req in requests:
+            scheduled = max(0, int(scheduled_tokens.get(req.id, 0) or 0))
+            tokens_after = max(0, int(req.num_computed_tokens) + scheduled)
+            shared_prefix = (
+                max(0, int(getattr(req, 'prefix_cache_hit', 0) or 0))
+                if getattr(req, 'prefix_cache_source_request_id', None) is not None
+                else 0
+            )
+            owned_tokens = max(0, tokens_after - shared_prefix)
+            blocks = (owned_tokens + self.block_size - 1) // self.block_size
+            backed_bytes = self.get_kv(blocks * self.block_size)
+            previous = int(self._l2_request_bytes.get(int(req.id), 0))
+            added_l2 += max(0, backed_bytes - previous) * self._l2_size_scale
+            active_blocks = (tokens_after + self.block_size - 1) // self.block_size
+            active_bytes = self.get_kv(active_blocks * self.block_size)
+            updates.append((int(req.id), backed_bytes, active_bytes))
+        if self.cpu_used + added_l2 > self.cpu_mem:
+            raise RuntimeError(
+                f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] "
+                f"L2 backing needs {added_l2 / MB_TO_BYTE:.2f}MB but only "
+                f"{(self.cpu_mem - self.cpu_used) / MB_TO_BYTE:.2f}MB is available."
+            )
+        self.cpu_used += added_l2
+        for request_id, backed_bytes, active_bytes in updates:
+            self._l2_request_bytes[request_id] = max(
+                int(self._l2_request_bytes.get(request_id, 0)), backed_bytes
+            )
+            self._l1_request_bytes[request_id] = active_bytes
+
+    def reserve_initial_backing(self, request_id, token_count, shared_tokens=0):
+        """Account an initialized history extent in the inclusive L2 pool."""
+        if not self.l2_retains_l1:
+            return
+        request_id = int(request_id)
+        owned_tokens = max(0, int(token_count) - max(0, int(shared_tokens)))
+        blocks = (owned_tokens + self.block_size - 1) // self.block_size
+        backed_bytes = self.get_kv(blocks * self.block_size)
+        previous = int(self._l2_request_bytes.get(request_id, 0))
+        added = max(0, backed_bytes - previous) * self._l2_size_scale
+        if self.cpu_used + added > self.cpu_mem:
+            raise RuntimeError(
+                f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] "
+                f"initialized L2 backing needs {added / MB_TO_BYTE:.2f}MB but only "
+                f"{(self.cpu_mem - self.cpu_used) / MB_TO_BYTE:.2f}MB is available."
+            )
+        self.cpu_used += added
+        self._l2_request_bytes[request_id] = max(previous, backed_bytes)
+
+    def deactivate_l1(self, request_id):
+        if self.l2_retains_l1:
+            self._l1_request_bytes.pop(int(request_id), None)
+
+    def release_logical_request(self, request_id):
+        if not self.l2_retains_l1:
+            return
+        request_id = int(request_id)
+        self._l1_request_bytes.pop(request_id, None)
+        released = self._l2_request_bytes.pop(request_id, 0) * self._l2_size_scale
+        self.cpu_used -= released
+
+    def logical_pool_snapshot(self):
+        l1_kv_used = max(0, int(self.npu_used) - int(self.resident_weight))
+        overlap = 0
+        if self.l2_retains_l1:
+            overlap = min(
+                l1_kv_used,
+                sum(
+                    min(size, int(self._l2_request_bytes.get(request_id, 0)))
+                    for request_id, size in self._l1_request_bytes.items()
+                ),
+            )
+        return {
+            'L1': {
+                'capacity_bytes': int(self.npu_mem),
+                'used_bytes': int(self.npu_used),
+                'reserved_bytes': 0,
+                'scope': 'per_rank',
+                'overlap_bytes': int(overlap),
+            },
+            'L2': {
+                'capacity_bytes': int(self.cpu_mem),
+                'used_bytes': int(self.cpu_used),
+                'reserved_bytes': 0,
+                'scope': self.l2_scope,
+                'overlap_bytes': int(overlap),
+            },
+        }
+
     def get_weight(self):
         """Per-GPU model weight in bytes.
 
@@ -245,6 +348,10 @@ class MemoryModel():
                 blocks_before = (computed_before + self.block_size - 1) // self.block_size if computed_before > 0 else 0
                 
                 
+                # Evicted KV has no local blocks: admission must charge the
+                # restored context as well as the new tokens.
+                if req.evict:
+                    blocks_before = 0
                 new_blocks = max(0, blocks_after - blocks_before)
                 block_kv_size += self.get_kv(new_blocks * self.block_size)
                 # print("[DEBUG] hit : {} | tokens_this_step : {} | computed_before : {} | total_after : {} | new_blocks : {} | block_kv_size : {}".format(

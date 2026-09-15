@@ -31,6 +31,8 @@ class HBFrameFrontendConfig:
     kv_cache_dtype: str = "auto"
     npu_mem_gb: float = 80.0
     cpu_mem_gb: float = 512.0
+    l2_scope: str = "node"
+    l2_retains_l1: bool = False
     cxl_mem_gb: float = 0.0
     npu_kv_capacity_mb: float | None = None
     weight_residency: str = "npu"
@@ -194,20 +196,8 @@ def snapshot_batch(batch, scheduler: Scheduler, *, extra_attrs=None) -> HBFrameB
             "hbframe_scheduler_decision": dict(getattr(scheduler, "_hbframe_last_decision", {}) or {}),
             "logical_memory": {
                 "schema": "hbframe-logical-memory-v1",
-                "pools": {
-                    "L1": {
-                        "capacity_bytes": int(scheduler.memory.npu_mem),
-                        "used_bytes": int(scheduler.memory.npu_used),
-                        "reserved_bytes": 0,
-                        "scope": "per_rank",
-                    },
-                    "L2": {
-                        "capacity_bytes": int(scheduler.memory.cpu_mem),
-                        "used_bytes": int(scheduler.memory.cpu_used),
-                        "reserved_bytes": 0,
-                        "scope": "node",
-                    },
-                },
+                "pools": scheduler.memory.logical_pool_snapshot(),
+                "l2_retains_l1": bool(scheduler.memory.l2_retains_l1),
                 "transfers": tuple(
                     dict(item)
                     for item in getattr(batch, "logical_pool_transfers", ())
@@ -260,6 +250,8 @@ class HBFrameServingFrontend:
                 ep_size=config.ep_size,
                 kv_cache_dtype=config.kv_cache_dtype,
                 weight_residency=config.weight_residency,
+                l2_retains_l1=config.l2_retains_l1,
+                l2_scope=config.l2_scope,
             )
             if config.npu_kv_capacity_mb is not None:
                 kv_bytes = int(float(config.npu_kv_capacity_mb) * 1024 * 1024)
@@ -429,6 +421,12 @@ class HBFrameServingFrontend:
             normalized["prefix_cache_source_request_id"] = int(source_request_id)
         self._initial_requests.append(normalized)
         self._initial_request_ids.add(request_id)
+        for scheduler in self.schedulers:
+            scheduler.memory.reserve_initial_backing(
+                request_id,
+                input_tokens,
+                shared_tokens=prefix_hit,
+            )
 
     @property
     def initial_requests(self) -> tuple[dict[str, object], ...]:

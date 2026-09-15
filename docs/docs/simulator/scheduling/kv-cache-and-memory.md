@@ -163,6 +163,24 @@ This is what produces the bursty memory-usage pattern you see in
 long-context workloads: the cache fills, evicts, refills, and the
 scheduler's effective batch size oscillates with available memory.
 
+## Base scheduler under KV pressure
+
+When no batch fits, the base scheduler can spill resident, partially computed
+prefills as well as decode requests. It keeps the first waiting request as the
+progress target and selects other resident candidates with a positive KV size.
+The emitted eviction belongs to the selected request; an external memory
+backend must preserve that identity and the committed transfer size.
+
+Restoring an evicted request reserves its existing context plus the new tokens.
+Its old context is no longer resident in NPU memory, so charging only the token
+increment would undercount occupancy. This applies to the base scheduler;
+prefix-cache schedulers have additional ownership and eviction rules.
+
+In the HBFrame integration, MemoryService supplies the fixed frontend KV budget,
+and the frontend owns the logical L1/L2 ledger. Physical HBM/HBF replicas are a
+separate ledger. An infeasible workload that cannot schedule work or advance to
+a future arrival is reported as failed instead of silently ending the workload.
+
 ## Per-instance vs per-node accounting (gotcha)
 
 The `npu_used` and the NPU prefix cache are **per-instance**. Two

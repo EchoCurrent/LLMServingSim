@@ -18,7 +18,7 @@ class Scheduler:
                  num_npus, tp_size, pp_size, npu_mem, cpu_mem,
                  start_npu, pd_type, fp, block_size, req_num,
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
-                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto', weight_residency='npu'):
+                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto', weight_residency='npu', l2_retains_l1=False, l2_scope='node'):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -44,7 +44,7 @@ class Scheduler:
         self.batch_ids = -1
 
         # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype, weight_residency=weight_residency)
+        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype, weight_residency=weight_residency, l2_retains_l1=l2_retains_l1, l2_scope=l2_scope)
         self.hbframe_oracle = None
         self._hbframe_last_decision = {}
 
@@ -284,6 +284,13 @@ class Scheduler:
             
             # ============ STEP 3: Eviction if needed ============
             while temp_len == 0:
+                # Partial prefills hold KV too. Preserve the first request so
+                # at least one sequence can progress, and spill other resident
+                # requests even when no decode request is currently selected.
+                gen_req = [req for req in self.request
+                           if req is not batch_req[0] and not req.evict
+                           and req.num_computed_tokens > 0
+                           and self.memory.get_evict_kv(req) > 0]
                 # print("Evict Request to CPU due to memory limitation")
                 # preempt request one by one until there is enough space
                 if len(gen_req) == 0:
@@ -306,6 +313,7 @@ class Scheduler:
                     "size_bytes": int(victim_size),
                     "size_scope": "per_rank",
                     "reason": "scheduler_evict",
+                    "retains_backing": bool(self.memory.l2_retains_l1),
                 })
                 victim.evict = True
                 self.logger.info("Eviction of the request #%d", victim.id)
@@ -316,10 +324,11 @@ class Scheduler:
                 # MemoryModel.apply_kv_cache_events convention), so scale by
                 # num_npus when crossing the NPU->CPU boundary.
                 self.memory.free(victim_size, Device.NPU)
-                self.memory.allocate(victim_size * self.num_npus, Device.CPU)
+                self.memory.deactivate_l1(victim.id)
+                if not self.memory.l2_retains_l1:
+                    self.memory.allocate(victim_size * self.num_npus, Device.CPU)
 
-                if len(gen_req) < batch_len:
-                    batch_len = len(gen_req)
+                batch_len = len(batch_req)
 
                 # check if can batch
                 for i in range(batch_len, -1, -1):
@@ -353,17 +362,19 @@ class Scheduler:
                         "size_bytes": int(request_load_size),
                         "size_scope": "per_rank",
                         "reason": "scheduler_load",
+                        "retains_backing": bool(self.memory.l2_retains_l1),
                     })
                     req.evict = False
                     self.logger.info("Loading the request #%d", req.id)
 
             # ============ STEP 4: Allocate memory ============
+            self.memory.reserve_logical_batch(batch_req, scheduled_tokens)
             if kv_size > 0:
                 self.memory.allocate(kv_size, Device.NPU)
             
             # load memory from cpu (host); see offload comment above —
             # load_size is per-rank, cpu_used is full-cluster.
-            if load_size > 0:
+            if load_size > 0 and not self.memory.l2_retains_l1:
                 self.memory.free(load_size * self.num_npus, Device.CPU)
             
             # ============ STEP 5: Build batch with lists ============
@@ -644,7 +655,9 @@ class Scheduler:
                     "size_bytes": int(self.memory.get_evict_kv(victim)),
                     "size_scope": "per_rank",
                     "reason": "scheduler_evict",
+                    "retains_backing": bool(self.memory.l2_retains_l1),
                 })
+                self.memory.deactivate_l1(victim.id)
                 self.logger.info("Eviction of the request #%d", victim.id)
                 gen_req = [req for req in gen_req if req.id != victim.id]
                 batch_req = [req for req in batch_req if req.id != victim.id]
@@ -701,6 +714,7 @@ class Scheduler:
                         "size_bytes": int(request_prefix_load_size),
                         "size_scope": "per_rank",
                         "reason": "prefix_load",
+                        "retains_backing": bool(self.memory.l2_retains_l1),
                     })
 
                 # Handle evicted requests
@@ -719,11 +733,13 @@ class Scheduler:
                         "size_bytes": int(request_load_size),
                         "size_scope": "per_rank",
                         "reason": "scheduler_load",
+                        "retains_backing": bool(self.memory.l2_retains_l1),
                     })
                     req.evict = False
                     self.logger.info("Loading the request #%d", req.id)
 
             # ============ STEP 5: Build batch with lists ============
+            self.memory.reserve_logical_batch(batch_req, scheduled_tokens)
             total_len = 0
             kv_len = 0
             num_prefill = 0
@@ -967,6 +983,7 @@ class Scheduler:
                 else:
                     kv_size = self.memory.get_evict_kv(req)
                     self.memory.free(kv_size, Device.NPU)
+                    self.memory.release_logical_request(req.id)
                 req.add_latency(finish)
                 self.done.append(req)
                 end_reqs.append(req)
