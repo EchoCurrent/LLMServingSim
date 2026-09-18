@@ -35,6 +35,7 @@ class HBFrameFrontendConfig:
     l2_retains_l1: bool = False
     cxl_mem_gb: float = 0.0
     npu_kv_capacity_mb: float | None = None
+    kv_eviction_has_fallback: bool = True
     weight_residency: str = "npu"
     num_npus: int = 1
     num_instances: int = 1
@@ -252,6 +253,7 @@ class HBFrameServingFrontend:
                 weight_residency=config.weight_residency,
                 l2_retains_l1=config.l2_retains_l1,
                 l2_scope=config.l2_scope,
+                kv_eviction_has_fallback=config.kv_eviction_has_fallback,
             )
             if config.npu_kv_capacity_mb is not None:
                 kv_bytes = int(float(config.npu_kv_capacity_mb) * 1024 * 1024)
@@ -421,10 +423,13 @@ class HBFrameServingFrontend:
             normalized["prefix_cache_source_request_id"] = int(source_request_id)
         self._initial_requests.append(normalized)
         self._initial_request_ids.add(request_id)
+        # A request's KV covers its whole sequence, matching ``get_kv``, so the
+        # history charge is the prompt plus the generated tokens the next turn
+        # reuses, less whatever prefix this request shares with its source.
         for scheduler in self.schedulers:
-            scheduler.memory.reserve_initial_backing(
+            scheduler.memory.reserve_initial_request(
                 request_id,
-                input_tokens,
+                input_tokens + output_tokens,
                 shared_tokens=prefix_hit,
             )
 

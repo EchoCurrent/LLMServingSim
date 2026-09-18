@@ -58,7 +58,7 @@ class Device(Enum):
     CXL = 3
 
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', weight_residency='npu', l2_retains_l1=False, l2_scope='node'):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', weight_residency='npu', l2_retains_l1=False, l2_scope='node', kv_eviction_has_fallback=True):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -77,8 +77,16 @@ class MemoryModel():
         self.prefix_storage = prefix_storage
         self.l2_retains_l1 = bool(l2_retains_l1)
         self.l2_scope = str(l2_scope)
+        # No fallback tier means the deployment forbids KV offload: an evicted
+        # range is dropped, not written out, so it must not be charged to L2.
+        self.kv_eviction_has_fallback = bool(kv_eviction_has_fallback)
         self._l1_request_bytes = {}
         self._l2_request_bytes = {}
+        # Initialized history is capacity ballast: it occupies L1 so the
+        # workload starts under real pressure, and it may be evicted to make
+        # room. It has no backing copy, so an evicted history request is
+        # dropped rather than reloaded.
+        self._initial_request_ids = set()
 
         self.config = get_config(model)
         self.n_embd = self.config['hidden_size']
@@ -192,16 +200,34 @@ class MemoryModel():
             )
             self._l1_request_bytes[request_id] = active_bytes
 
-    def reserve_initial_backing(self, request_id, token_count, shared_tokens=0):
-        """Account an initialized history extent in the inclusive L2 pool."""
-        if not self.l2_retains_l1:
-            return
+    def reserve_initial_request(self, request_id, token_count, shared_tokens=0):
+        """Charge an initialized history request to the L1 and L2 ledgers.
+
+        ``initialize_only`` requests never enter the scheduler, so the ordinary
+        ``allocate(kv_size, Device.NPU)`` call cannot charge their KV. Their
+        state is already committed on the host, so the frontend must account
+        for it here or it will see free capacity that does not exist and skip
+        eviction and admission limits. Initialized KV is always placed in a
+        compute-visible tier, which is exactly L1.
+        """
         request_id = int(request_id)
         owned_tokens = max(0, int(token_count) - max(0, int(shared_tokens)))
         blocks = (owned_tokens + self.block_size - 1) // self.block_size
-        backed_bytes = self.get_kv(blocks * self.block_size)
+        active_bytes = self.get_kv(blocks * self.block_size)
+        if self.npu_used + active_bytes > self.npu_mem:
+            raise RuntimeError(
+                f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] "
+                f"initialized L1 KV needs {active_bytes / MB_TO_BYTE:.2f}MB but only "
+                f"{(self.npu_mem - self.npu_used) / MB_TO_BYTE:.2f}MB is available."
+            )
+        self.npu_used += active_bytes
+        self._l1_request_bytes[request_id] = active_bytes
+        self._initial_request_ids.add(request_id)
+
+        if not self.l2_retains_l1:
+            return
         previous = int(self._l2_request_bytes.get(request_id, 0))
-        added = max(0, backed_bytes - previous) * self._l2_size_scale
+        added = max(0, active_bytes - previous) * self._l2_size_scale
         if self.cpu_used + added > self.cpu_mem:
             raise RuntimeError(
                 f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] "
@@ -209,11 +235,64 @@ class MemoryModel():
                 f"{(self.cpu_mem - self.cpu_used) / MB_TO_BYTE:.2f}MB is available."
             )
         self.cpu_used += added
-        self._l2_request_bytes[request_id] = max(previous, backed_bytes)
+        self._l2_request_bytes[request_id] = max(previous, active_bytes)
 
     def deactivate_l1(self, request_id):
         if self.l2_retains_l1:
             self._l1_request_bytes.pop(int(request_id), None)
+
+    def discard_l1(self, request_id):
+        """Release one request's L1 charge without producing a backing copy.
+
+        Used when a deployment has no fallback tier: the KV is dropped, not
+        written out, so the L2 ledger must not grow. Initialized history is
+        dropped the same way, which is why it is tracked separately.
+        """
+        request_id = int(request_id)
+        released = int(self._l1_request_bytes.pop(request_id, 0))
+        self._initial_request_ids.discard(request_id)
+        if released > 0:
+            self.npu_used = max(self.resident_weight, self.npu_used - released)
+        if self.l2_retains_l1:
+            self._l2_request_bytes.pop(request_id, None)
+        return released
+
+    def has_backing_for(self, request_id) -> bool:
+        """Whether an evicted request can be reloaded instead of recomputed."""
+        return int(request_id) in self._l2_request_bytes and self.l2_retains_l1
+
+    def evict_initial_history(self, required_bytes: int) -> list[int]:
+        """Drop initialized history until ``required_bytes`` is free.
+
+        Initialized history is capacity ballast with no backing copy, so it is
+        the first thing to give up when an active sequence needs room. Returns
+        the request ids that were dropped, oldest charge first.
+        """
+        freed = 0
+        dropped: list[int] = []
+        for request_id in sorted(self._initial_request_ids):
+            if freed >= int(required_bytes):
+                break
+            released = self.discard_l1(request_id)
+            if released > 0:
+                freed += released
+                dropped.append(int(request_id))
+        return dropped
+
+    def initial_history_bytes(self) -> int:
+        return sum(int(self._l1_request_bytes.get(rid, 0)) for rid in self._initial_request_ids)
+
+    def avail_bytes(self, device) -> int:
+        """Free bytes on a device, independent of the prefix-cache accounting."""
+        if device == Device.NPU:
+            return max(0, int(self.npu_mem) - int(self.npu_used))
+        if device in (Device.CPU, Device.CXL):
+            limit = self.cpu_mem if device == Device.CPU else self.cxl_mem
+            return max(0, int(limit) - int(self.cpu_used))
+        raise RuntimeError(
+            f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] "
+            f"Trying to get free size of unsupported device {device}"
+        )
 
     def release_logical_request(self, request_id):
         if not self.l2_retains_l1:
@@ -234,10 +313,16 @@ class MemoryModel():
                     for request_id, size in self._l1_request_bytes.items()
                 ),
             )
+        # ``used_bytes`` counts everything the ledger holds, which on L1 includes
+        # resident model weights; ``kv_used_bytes`` isolates the KV occupancy a
+        # caller comparing against a KV budget wants. ``weight_bytes`` closes the
+        # identity used_bytes == kv_used_bytes + weight_bytes on both tiers.
         return {
             'L1': {
                 'capacity_bytes': int(self.npu_mem),
                 'used_bytes': int(self.npu_used),
+                'kv_used_bytes': int(l1_kv_used),
+                'weight_bytes': int(self.resident_weight),
                 'reserved_bytes': 0,
                 'scope': 'per_rank',
                 'overlap_bytes': int(overlap),
@@ -245,6 +330,8 @@ class MemoryModel():
             'L2': {
                 'capacity_bytes': int(self.cpu_mem),
                 'used_bytes': int(self.cpu_used),
+                'kv_used_bytes': int(self.cpu_used),
+                'weight_bytes': 0,
                 'reserved_bytes': 0,
                 'scope': self.l2_scope,
                 'overlap_bytes': int(overlap),

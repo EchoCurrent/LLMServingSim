@@ -18,7 +18,7 @@ class Scheduler:
                  num_npus, tp_size, pp_size, npu_mem, cpu_mem,
                  start_npu, pd_type, fp, block_size, req_num,
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
-                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto', weight_residency='npu', l2_retains_l1=False, l2_scope='node'):
+                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto', weight_residency='npu', l2_retains_l1=False, l2_scope='node', kv_eviction_has_fallback=True):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -44,7 +44,7 @@ class Scheduler:
         self.batch_ids = -1
 
         # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype, weight_residency=weight_residency, l2_retains_l1=l2_retains_l1, l2_scope=l2_scope)
+        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype, weight_residency=weight_residency, l2_retains_l1=l2_retains_l1, l2_scope=l2_scope, kv_eviction_has_fallback=kv_eviction_has_fallback)
         self.hbframe_oracle = None
         self._hbframe_last_decision = {}
 
@@ -291,6 +291,24 @@ class Scheduler:
                            if req is not batch_req[0] and not req.evict
                            and req.num_computed_tokens > 0
                            and self.memory.get_evict_kv(req) > 0]
+                # Initialized history is capacity ballast: it has no backing
+                # copy and no future schedule, so give it up before preempting
+                # an active sequence. Size the request from the full batch,
+                # because the scan above ends on the empty-batch probe.
+                if not gen_req and self.memory._initial_request_ids:
+                    need = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
+                    deficit = max(0, need - self.memory.avail_bytes(Device.NPU))
+                    freed = self.memory.evict_initial_history(deficit or need)
+                    if freed:
+                        self._hbframe_last_decision.setdefault(
+                            "dropped_initial_history", []
+                        ).extend(freed)
+                        for i in range(batch_len, -1, -1):
+                            kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
+                            if self.memory.is_avail(kv_size, Device.NPU):
+                                temp_len = i
+                                break
+                        continue
                 # print("Evict Request to CPU due to memory limitation")
                 # preempt request one by one until there is enough space
                 if len(gen_req) == 0:
@@ -319,14 +337,19 @@ class Scheduler:
                 self.logger.info("Eviction of the request #%d", victim.id)
                 gen_req = [req for req in gen_req if req.id != victim.id]
                 batch_req = [req for req in batch_req if req.id != victim.id]
-                # spill to cpu (host) memory. get_evict_kv returns per-rank
-                # bytes; cpu_used is tracked in full-cluster bytes (matches
-                # MemoryModel.apply_kv_cache_events convention), so scale by
-                # num_npus when crossing the NPU->CPU boundary.
+                # Spill to CPU memory when the deployment has a fallback tier.
+                # get_evict_kv returns per-rank bytes; cpu_used is tracked in
+                # full-cluster bytes (matches MemoryModel.apply_kv_cache_events
+                # convention), so scale by num_npus when crossing the NPU->CPU
+                # boundary. Without a fallback tier the deployment forbids KV
+                # offload, so the range is dropped instead of written out.
                 self.memory.free(victim_size, Device.NPU)
-                self.memory.deactivate_l1(victim.id)
-                if not self.memory.l2_retains_l1:
-                    self.memory.allocate(victim_size * self.num_npus, Device.CPU)
+                if self.memory.kv_eviction_has_fallback:
+                    self.memory.deactivate_l1(victim.id)
+                    if not self.memory.l2_retains_l1:
+                        self.memory.allocate(victim_size * self.num_npus, Device.CPU)
+                else:
+                    self.memory.discard_l1(victim.id)
 
                 batch_len = len(batch_req)
 
@@ -374,7 +397,7 @@ class Scheduler:
             
             # load memory from cpu (host); see offload comment above —
             # load_size is per-rank, cpu_used is full-cluster.
-            if load_size > 0 and not self.memory.l2_retains_l1:
+            if load_size > 0 and self.memory.kv_eviction_has_fallback and not self.memory.l2_retains_l1:
                 self.memory.free(load_size * self.num_npus, Device.CPU)
             
             # ============ STEP 5: Build batch with lists ============
@@ -719,22 +742,36 @@ class Scheduler:
 
                 # Handle evicted requests
                 if req.evict:
-                    self.memory.prefix_match(req)
-                    self._apply_hbframe_prefix_decision(req)
-                    self.memory.lock_prefix(req, Device.NPU)
-                    if self.prefix_storage is not None:
-                        self.memory.unlock_prefix(req, Device.CPU)
-                    request_load_size = self.memory.get_evict_kv(req)
-                    evict_load_size += request_load_size
-                    logical_pool_transfers.append({
-                        "request_id": int(req.id),
-                        "source_pool": "L2",
-                        "target_pool": "L1",
-                        "size_bytes": int(request_load_size),
-                        "size_scope": "per_rank",
-                        "reason": "scheduler_load",
-                        "retains_backing": bool(self.memory.l2_retains_l1),
-                    })
+                    if self.memory.kv_eviction_has_fallback:
+                        self.memory.prefix_match(req)
+                        self._apply_hbframe_prefix_decision(req)
+                        self.memory.lock_prefix(req, Device.NPU)
+                        if self.prefix_storage is not None:
+                            self.memory.unlock_prefix(req, Device.CPU)
+                        request_load_size = self.memory.get_evict_kv(req)
+                        evict_load_size += request_load_size
+                        logical_pool_transfers.append({
+                            "request_id": int(req.id),
+                            "source_pool": "L2",
+                            "target_pool": "L1",
+                            "size_bytes": int(request_load_size),
+                            "size_scope": "per_rank",
+                            "reason": "scheduler_load",
+                            "retains_backing": bool(self.memory.l2_retains_l1),
+                        })
+                    else:
+                        # No fallback tier: the KV was dropped, not written out.
+                        # Rewind the sequence and recompute its prompt instead of
+                        # reloading a copy that does not exist.
+                        req.num_computed_tokens = 0
+                        req.npu_cache_hit = 0
+                        req.storage_cache_hit = 0
+                        req.prefix_cache_hit = 0
+                        req.is_init = False
+                        req.npu_last_node = None
+                        req._prefix_locked = False
+                        req._prefix_resolved = False
+                        self._hbframe_last_decision.setdefault("recomputed_requests", []).append(int(req.id))
                     req.evict = False
                     self.logger.info("Loading the request #%d", req.id)
 
