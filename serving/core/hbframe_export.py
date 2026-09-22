@@ -264,6 +264,12 @@ class HBFrameServingFrontend:
                     if hasattr(scheduler.memory, "npu_prefix_cache"):
                         scheduler.memory.npu_prefix_cache.capacity = scheduler.memory.mem_for_kv
             scheduler.hbframe_oracle = scheduler_oracle
+            if (scheduler_oracle is not None
+                    and hasattr(scheduler_oracle, "frontend_pool_snapshot")
+                    and scheduler_oracle.config.scheduler_admission_enabled
+                    and scheduler_oracle.config.kv_management_policy in {
+                        "external_block_group_lru", "peer_replicated_balanced", "peer_replicated_capacity"}):
+                scheduler.memory.hbframe_pool_snapshot = scheduler_oracle.frontend_pool_snapshot
             return scheduler
 
         if str(config.pd_mode).lower() == "disaggregated":

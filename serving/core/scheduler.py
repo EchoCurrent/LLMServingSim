@@ -63,12 +63,20 @@ class Scheduler:
             scheduled_tokens=scheduled_tokens,
         )
         self._hbframe_last_decision = dict(decision or {})
+        if decision.get("physical_admission"):
+            victims = set(decision["preempted_request_ids"])
+            for req in self.request:
+                if req.id in victims:
+                    req.evict = True
+            for req in filtered_req:
+                req.evict = False  # The committed physical_restore transfer owns reload.
         return filtered_req, filtered_tokens
 
     def _apply_hbframe_prefix_decision(self, req):
         oracle = getattr(self, "hbframe_oracle", None)
         if oracle is None or not hasattr(oracle, "adjust_prefix_match"):
             return
+        previous_npu_hit = int(getattr(req, "npu_cache_hit", 0) or 0)
         decision = oracle.adjust_prefix_match(scheduler=self, req=req)
         if not decision:
             return
@@ -78,8 +86,33 @@ class Scheduler:
             req.storage_cache_hit = int(decision["storage_cache_hit"])
         if "prefix_cache_hit" in decision:
             req.prefix_cache_hit = int(decision["prefix_cache_hit"])
+        req.hbframe_prefix_restore_pending = bool(decision.get("restore_prefix_to_l1", False))
+        if "npu_cache_hit" in decision and int(getattr(req, "npu_cache_hit", 0) or 0) <= 0:
+            req.npu_last_node = None
+        elif int(getattr(req, "npu_cache_hit", 0) or 0) < previous_npu_hit:
+            hit = int(req.npu_cache_hit)
+            tokens = getattr(req, "input_hash_ids", None)
+            req.npu_last_node = (
+                None
+                if hit <= 0 or not tokens
+                else self.memory.npu_prefix_cache.match_prefix(tokens[:hit]).last_device_node
+            )
         req.num_computed_tokens = max(int(req.num_computed_tokens), int(getattr(req, "prefix_cache_hit", 0)))
         self._hbframe_last_decision.setdefault("prefix_decisions", []).append(dict(decision))
+
+    def _commit_hbframe_prefix_restores(self, requests):
+        transfers = []
+        for req in requests:
+            if not req.hbframe_prefix_restore_pending:
+                continue
+            transfers.append({
+                "request_id": int(req.id), "source_pool": "L2", "target_pool": "L1",
+                "size_bytes": int(self.memory.get_kv(req.prefix_cache_hit)),
+                "size_scope": "per_rank", "reason": "prefix_restore",
+                "retains_backing": bool(self.memory.l2_retains_l1),
+            })
+            req.hbframe_prefix_restore_pending = False
+        return transfers
 
     def _resolve_new_request_prefix(self, req):
         """Resolve prefix state before phase classification and token allocation.
@@ -276,89 +309,92 @@ class Scheduler:
                 return None
             # ============ STEP 2: KV size calculation (with scheduled_tokens) ============
             temp_len = batch_len
-            for i in range(batch_len, -1, -1):
-                kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                if self.memory.is_avail(kv_size, Device.NPU):
-                    temp_len = i
-                    break
-            
-            # ============ STEP 3: Eviction if needed ============
-            while temp_len == 0:
-                # Partial prefills hold KV too. Preserve the first request so
-                # at least one sequence can progress, and spill other resident
-                # requests even when no decode request is currently selected.
-                gen_req = [req for req in self.request
-                           if req is not batch_req[0] and not req.evict
-                           and req.num_computed_tokens > 0
-                           and self.memory.get_evict_kv(req) > 0]
-                # Initialized history is capacity ballast: it has no backing
-                # copy and no future schedule, so give it up before preempting
-                # an active sequence. Size the request from the full batch,
-                # because the scan above ends on the empty-batch probe.
-                if not gen_req and self.memory._initial_request_ids:
-                    need = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
-                    deficit = max(0, need - self.memory.avail_bytes(Device.NPU))
-                    freed = self.memory.evict_initial_history(deficit or need)
-                    if freed:
-                        self._hbframe_last_decision.setdefault(
-                            "dropped_initial_history", []
-                        ).extend(freed)
-                        for i in range(batch_len, -1, -1):
-                            kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                            if self.memory.is_avail(kv_size, Device.NPU):
-                                temp_len = i
-                                break
-                        continue
-                # print("Evict Request to CPU due to memory limitation")
-                # preempt request one by one until there is enough space
-                if len(gen_req) == 0:
-                    return None
-                
-                # check already evicted request
-                if gen_req[-1].evict:
-                    gen_req = gen_req[:-1]
-                    continue
-
-                victim = self._choose_hbframe_eviction_victim(gen_req, kv_size)
-                if victim is None:
-                    return None
-                victim_size = self.memory.get_evict_kv(victim)
-                evict_size += victim_size
-                logical_pool_transfers.append({
-                    "request_id": int(victim.id),
-                    "source_pool": "L1",
-                    "target_pool": "L2",
-                    "size_bytes": int(victim_size),
-                    "size_scope": "per_rank",
-                    "reason": "scheduler_evict",
-                    "retains_backing": bool(self.memory.l2_retains_l1),
-                })
-                victim.evict = True
-                self.logger.info("Eviction of the request #%d", victim.id)
-                gen_req = [req for req in gen_req if req.id != victim.id]
-                batch_req = [req for req in batch_req if req.id != victim.id]
-                # Spill to CPU memory when the deployment has a fallback tier.
-                # get_evict_kv returns per-rank bytes; cpu_used is tracked in
-                # full-cluster bytes (matches MemoryModel.apply_kv_cache_events
-                # convention), so scale by num_npus when crossing the NPU->CPU
-                # boundary. Without a fallback tier the deployment forbids KV
-                # offload, so the range is dropped instead of written out.
-                self.memory.free(victim_size, Device.NPU)
-                if self.memory.kv_eviction_has_fallback:
-                    self.memory.deactivate_l1(victim.id)
-                    if not self.memory.l2_retains_l1:
-                        self.memory.allocate(victim_size * self.num_npus, Device.CPU)
-                else:
-                    self.memory.discard_l1(victim.id)
-
-                batch_len = len(batch_req)
-
-                # check if can batch
+            if self._hbframe_last_decision.get("physical_admission"):
+                logical_pool_transfers.extend(self._hbframe_last_decision["logical_transfers"])
+            else:
                 for i in range(batch_len, -1, -1):
                     kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
                     if self.memory.is_avail(kv_size, Device.NPU):
                         temp_len = i
                         break
+            
+                # ============ STEP 3: Eviction if needed ============
+                while temp_len == 0:
+                    # Partial prefills hold KV too. Preserve the first request so
+                    # at least one sequence can progress, and spill other resident
+                    # requests even when no decode request is currently selected.
+                    gen_req = [req for req in self.request
+                               if req is not batch_req[0] and not req.evict
+                               and req.num_computed_tokens > 0
+                               and self.memory.get_evict_kv(req) > 0]
+                    # Initialized history is capacity ballast: it has no backing
+                    # copy and no future schedule, so give it up before preempting
+                    # an active sequence. Size the request from the full batch,
+                    # because the scan above ends on the empty-batch probe.
+                    if not gen_req and self.memory._initial_request_ids:
+                        need = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
+                        deficit = max(0, need - self.memory.avail_bytes(Device.NPU))
+                        freed = self.memory.evict_initial_history(deficit or need)
+                        if freed:
+                            self._hbframe_last_decision.setdefault(
+                                "dropped_initial_history", []
+                            ).extend(freed)
+                            for i in range(batch_len, -1, -1):
+                                kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
+                                if self.memory.is_avail(kv_size, Device.NPU):
+                                    temp_len = i
+                                    break
+                            continue
+                    # print("Evict Request to CPU due to memory limitation")
+                    # preempt request one by one until there is enough space
+                    if len(gen_req) == 0:
+                        return None
+                
+                    # check already evicted request
+                    if gen_req[-1].evict:
+                        gen_req = gen_req[:-1]
+                        continue
+
+                    victim = self._choose_hbframe_eviction_victim(gen_req, kv_size)
+                    if victim is None:
+                        return None
+                    victim_size = self.memory.get_evict_kv(victim)
+                    evict_size += victim_size
+                    logical_pool_transfers.append({
+                        "request_id": int(victim.id),
+                        "source_pool": "L1",
+                        "target_pool": "L2",
+                        "size_bytes": int(victim_size),
+                        "size_scope": "per_rank",
+                        "reason": "scheduler_evict",
+                        "retains_backing": bool(self.memory.l2_retains_l1),
+                    })
+                    victim.evict = True
+                    self.logger.info("Eviction of the request #%d", victim.id)
+                    gen_req = [req for req in gen_req if req.id != victim.id]
+                    batch_req = [req for req in batch_req if req.id != victim.id]
+                    # Spill to CPU memory when the deployment has a fallback tier.
+                    # get_evict_kv returns per-rank bytes; cpu_used is tracked in
+                    # full-cluster bytes (matches MemoryModel.apply_kv_cache_events
+                    # convention), so scale by num_npus when crossing the NPU->CPU
+                    # boundary. Without a fallback tier the deployment forbids KV
+                    # offload, so the range is dropped instead of written out.
+                    self.memory.free(victim_size, Device.NPU)
+                    if self.memory.kv_eviction_has_fallback:
+                        self.memory.deactivate_l1(victim.id)
+                        if not self.memory.l2_retains_l1:
+                            self.memory.allocate(victim_size * self.num_npus, Device.CPU)
+                    else:
+                        self.memory.discard_l1(victim.id)
+
+                    batch_len = len(batch_req)
+
+                    # check if can batch
+                    for i in range(batch_len, -1, -1):
+                        kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
+                        if self.memory.is_avail(kv_size, Device.NPU):
+                            temp_len = i
+                            break
 
             batch_len = temp_len
             batch_req = batch_req[:batch_len]
@@ -391,6 +427,7 @@ class Scheduler:
                     self.logger.info("Loading the request #%d", req.id)
 
             # ============ STEP 4: Allocate memory ============
+            logical_pool_transfers.extend(self._commit_hbframe_prefix_restores(batch_req))
             self.memory.reserve_logical_batch(batch_req, scheduled_tokens)
             if kv_size > 0:
                 self.memory.allocate(kv_size, Device.NPU)
@@ -628,89 +665,94 @@ class Scheduler:
             evict_size = 0
             logical_pool_transfers = []
             temp_len = batch_len
-            total_useable_size = self.memory.avail_size(Device.NPU) + self.memory.evictable_size(Device.NPU)
-            
-            for i in range(batch_len, -1, -1):
-                kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                if total_useable_size >= kv_size:
-                    temp_len = i
-                    break
-            
-            # ============ STEP 3: Eviction if needed ============
             evicted_req = []
-            while temp_len == 0:
-                # print("eviction occurs!!")
-                if len(gen_req) == 0:
-                    # print("gen_req length == 0 (No decode) => return None (No Batch)")
-                    # No request to evict but no memory - rollback prefix cache lock
-                    for req in batch_req:
-                        if req.is_prefill() and req._prefix_locked:
-                            
-                            self.memory.unlock_prefix(req, Device.NPU)
-                            self.memory.erase_prefix_info(req)
-                            req._prefix_locked = False
-                    return None
-                
-                # Check already evicted request
-                if gen_req[-1].evict:
-                    gen_req = gen_req[:-1]
-                    continue
-                
-                # Evict the last decode request
-                # (DEPRECATED) self.memory.unlock_prefix(gen_req[-1], Device.NPU)
-                # (DEPRECATED) self.memory.erase_prefix_info(gen_req[-1])
-                victim = self._choose_hbframe_eviction_victim(gen_req, kv_size)
-                if victim is None:
-                    return None
-                if victim.is_prefill() and getattr(victim, '_prefix_locked', False):
-                    self.memory.unlock_prefix(victim, Device.NPU)
-                    # self.memory.erase_prefix_info(gen_req[-1])
-                    victim._prefix_locked = False
-                
-                current_usable_size = self.memory.avail_size(Device.NPU) + self.memory.evictable_size(Device.NPU)
-                
-                victim.evict = True
-                evicted_req.append(victim)
-                logical_pool_transfers.append({
-                    "request_id": int(victim.id),
-                    "source_pool": "L1",
-                    "target_pool": "L2",
-                    "size_bytes": int(self.memory.get_evict_kv(victim)),
-                    "size_scope": "per_rank",
-                    "reason": "scheduler_evict",
-                    "retains_backing": bool(self.memory.l2_retains_l1),
-                })
-                self.memory.deactivate_l1(victim.id)
-                self.logger.info("Eviction of the request #%d", victim.id)
-                gen_req = [req for req in gen_req if req.id != victim.id]
-                batch_req = [req for req in batch_req if req.id != victim.id]
-                
-                if len(gen_req) < batch_len:
-                    batch_len = len(gen_req)
-                
-                # Check if can batch now
+            if self._hbframe_last_decision.get("physical_admission"):
+                logical_pool_transfers.extend(self._hbframe_last_decision["logical_transfers"])
+                kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
+            else:
+                total_useable_size = self.memory.avail_size(Device.NPU) + self.memory.evictable_size(Device.NPU)
+            
                 for i in range(batch_len, -1, -1):
                     kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                    if current_usable_size >= kv_size:
+                    if total_useable_size >= kv_size:
                         temp_len = i
                         break
-
-            # Unlock prefix for requests that didn't make it into the batch
-            for req in batch_req[temp_len:]:
-                if req.is_prefill() and req._prefix_locked:
-                    self.memory.unlock_prefix(req, Device.NPU)
-                    self.memory.erase_prefix_info(req)
-                    req._prefix_locked = False
-
-            batch_len = temp_len
-            batch_req = batch_req[:batch_len]
             
-            # Recompute kv_size for final batch
-            kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
-            evict_size = (kv_size - self.memory.avail_size(Device.NPU)) if kv_size > self.memory.avail_size(Device.NPU) else 0
+                # ============ STEP 3: Eviction if needed ============
+                evicted_req = []
+                while temp_len == 0:
+                    # print("eviction occurs!!")
+                    if len(gen_req) == 0:
+                        # print("gen_req length == 0 (No decode) => return None (No Batch)")
+                        # No request to evict but no memory - rollback prefix cache lock
+                        for req in batch_req:
+                            if req.is_prefill() and req._prefix_locked:
+                            
+                                self.memory.unlock_prefix(req, Device.NPU)
+                                self.memory.erase_prefix_info(req)
+                                req._prefix_locked = False
+                        return None
+                
+                    # Check already evicted request
+                    if gen_req[-1].evict:
+                        gen_req = gen_req[:-1]
+                        continue
+                
+                    # Evict the last decode request
+                    # (DEPRECATED) self.memory.unlock_prefix(gen_req[-1], Device.NPU)
+                    # (DEPRECATED) self.memory.erase_prefix_info(gen_req[-1])
+                    victim = self._choose_hbframe_eviction_victim(gen_req, kv_size)
+                    if victim is None:
+                        return None
+                    if victim.is_prefill() and getattr(victim, '_prefix_locked', False):
+                        self.memory.unlock_prefix(victim, Device.NPU)
+                        # self.memory.erase_prefix_info(gen_req[-1])
+                        victim._prefix_locked = False
+                
+                    current_usable_size = self.memory.avail_size(Device.NPU) + self.memory.evictable_size(Device.NPU)
+                
+                    victim.evict = True
+                    evicted_req.append(victim)
+                    logical_pool_transfers.append({
+                        "request_id": int(victim.id),
+                        "source_pool": "L1",
+                        "target_pool": "L2",
+                        "size_bytes": int(self.memory.get_evict_kv(victim)),
+                        "size_scope": "per_rank",
+                        "reason": "scheduler_evict",
+                        "retains_backing": bool(self.memory.l2_retains_l1),
+                    })
+                    self.memory.deactivate_l1(victim.id)
+                    self.logger.info("Eviction of the request #%d", victim.id)
+                    gen_req = [req for req in gen_req if req.id != victim.id]
+                    batch_req = [req for req in batch_req if req.id != victim.id]
+                
+                    if len(gen_req) < batch_len:
+                        batch_len = len(gen_req)
+                
+                    # Check if can batch now
+                    for i in range(batch_len, -1, -1):
+                        kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
+                        if current_usable_size >= kv_size:
+                            temp_len = i
+                            break
+
+                # Unlock prefix for requests that didn't make it into the batch
+                for req in batch_req[temp_len:]:
+                    if req.is_prefill() and req._prefix_locked:
+                        self.memory.unlock_prefix(req, Device.NPU)
+                        self.memory.erase_prefix_info(req)
+                        req._prefix_locked = False
+
+                batch_len = temp_len
+                batch_req = batch_req[:batch_len]
             
-            if evict_size > 0:
-                self.memory.evict_prefix_cache(evict_size, Device.NPU)
+                # Recompute kv_size for final batch
+                kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
+                evict_size = (kv_size - self.memory.avail_size(Device.NPU)) if kv_size > self.memory.avail_size(Device.NPU) else 0
+            
+                if evict_size > 0:
+                    self.memory.evict_prefix_cache(evict_size, Device.NPU)
 
             # ============ STEP 4: Allocate memory & handle evicted requests ============
             evict_load_size = 0
@@ -776,6 +818,7 @@ class Scheduler:
                     self.logger.info("Loading the request #%d", req.id)
 
             # ============ STEP 5: Build batch with lists ============
+            logical_pool_transfers.extend(self._commit_hbframe_prefix_restores(batch_req))
             self.memory.reserve_logical_batch(batch_req, scheduled_tokens)
             total_len = 0
             kv_len = 0
@@ -794,7 +837,7 @@ class Scheduler:
             for req in evicted_req:
                 total_size += self.memory.get_total_kv(req) * self.num_npus
             
-            if self.prefix_storage is not None:
+            if self.prefix_storage is not None and not self._hbframe_last_decision.get("physical_admission"):
                 storage_evict_size = (total_size - self.memory.avail_size(self.prefix_storage)) if total_size > self.memory.avail_size(self.prefix_storage) else 0
                 if storage_evict_size > 0:
                     self.memory.evict_prefix_cache(storage_evict_size, self.prefix_storage)

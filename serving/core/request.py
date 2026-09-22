@@ -50,6 +50,7 @@ class Request:
         # For prefix cache lock tracking
         self._prefix_locked = False
         self._prefix_resolved = False
+        self.hbframe_prefix_restore_pending = False
 
         # An HBFrame initialize_only history can restore an already-active
         # sequence directly at its next decode token.
