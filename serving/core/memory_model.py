@@ -159,6 +159,7 @@ class MemoryModel():
         # Hash id -> token length for corresponding prefix cache block
         self._npu_cache_hashtolen = {}
         self._cpu_cache_hashtolen = {}
+        self.hbframe_pool_snapshot = None
         self._bytes_per_token = self.get_kv(1)  # bytes per token for kv cache
 
     @property
@@ -167,7 +168,7 @@ class MemoryModel():
 
     def reserve_logical_batch(self, requests, scheduled_tokens):
         """Reserve inclusive L2 backing and record active L1 membership."""
-        if not self.l2_retains_l1:
+        if not self.l2_retains_l1 or self.hbframe_pool_snapshot is not None:
             return
         updates = []
         added_l2 = 0
@@ -303,6 +304,8 @@ class MemoryModel():
         self.cpu_used -= released
 
     def logical_pool_snapshot(self):
+        if self.hbframe_pool_snapshot is not None:
+            return self.hbframe_pool_snapshot(self)
         l1_kv_used = max(0, int(self.npu_used) - int(self.resident_weight))
         overlap = 0
         if self.l2_retains_l1:
@@ -389,12 +392,10 @@ class MemoryModel():
         return block_weight
 
     def get_kv(self, seq):
-        # shape of kv cache
-        # (kv_head, batch_size, n_embd//n_head, seq_len) per layer
-        # return batch_size = 1 to caclulate max batch_size in scheduler
-
+        # MLA latent KV is replicated across TP ranks; only PP shards layers.
         kv_factor = 1 if self.uses_mla else 2
-        return kv_factor * self.kv_dim * seq * self.n_layer * self.kv_fp // self.num_npus
+        divisor = self.pp_size if self.uses_mla else self.num_npus
+        return kv_factor * self.kv_dim * seq * self.n_layer * self.kv_fp // divisor
     
     # get the total size of current kv cache for the request
     # used when adding prefilled request to decode instance.
@@ -416,7 +417,7 @@ class MemoryModel():
         block_kv_size = 0
         for i in range(batch_len):
             req = batch_req[i]
-            if req.evict or req.is_prefill():
+            if req.evict or req.is_prefill() or req.hbframe_prefix_restore_pending:
                 # (decode + evict) or (prefill) should load all of KV caches
                 hit = req.npu_cache_hit if self.enable_prefix_caching else 0
                 
@@ -437,7 +438,7 @@ class MemoryModel():
                 
                 # Evicted KV has no local blocks: admission must charge the
                 # restored context as well as the new tokens.
-                if req.evict:
+                if req.evict or req.hbframe_prefix_restore_pending:
                     blocks_before = 0
                 new_blocks = max(0, blocks_after - blocks_before)
                 block_kv_size += self.get_kv(new_blocks * self.block_size)
@@ -500,6 +501,8 @@ class MemoryModel():
     # -------------------- Memory Management --------------------
     
     def allocate(self, size, device):
+        if self.hbframe_pool_snapshot is not None:
+            return
         if device == Device.NPU:
             if self.npu_used + size > self.npu_mem:
                 raise RuntimeError(
@@ -534,6 +537,8 @@ class MemoryModel():
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to allocate KV cache in unsupported device {device}")
     
     def free(self, size, device):
+        if self.hbframe_pool_snapshot is not None:
+            return
         if device == Device.NPU:
             if self.npu_used - size < self.resident_weight:
                 raise RuntimeError(
@@ -821,6 +826,12 @@ class MemoryModel():
     
     # Count load/unload events from prefix cache and update memory usage
     def apply_kv_cache_events(self):
+        if self.hbframe_pool_snapshot is not None:
+            # Radix retains token matching metadata; MemoryService owns placement.
+            self.npu_prefix_cache.take_events()
+            if self.prefix_storage is not None:
+                self.second_tier_prefix_cache.take_events()
+            return
         # if not self.enable_prefix_caching:
         #     return
         npu_byte_alloc = 0
