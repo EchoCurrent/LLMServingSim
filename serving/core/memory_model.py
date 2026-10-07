@@ -159,8 +159,89 @@ class MemoryModel():
         # Hash id -> token length for corresponding prefix cache block
         self._npu_cache_hashtolen = {}
         self._cpu_cache_hashtolen = {}
-        self.hbframe_pool_snapshot = None
+        self.system_state = None
+        self.require_local_kv = False
         self._bytes_per_token = self.get_kv(1)  # bytes per token for kv cache
+
+    def update_system_state(self, state, active_requests):
+        """Rebase the native ledger from a quiescent, data-only system snapshot."""
+        self.system_state = state
+        self._system_evicted = set()
+        self._system_objects = {row["object_uid"]: row for row in state.kv_objects}
+        self._system_mappings = {}
+        for row in state.kv_mappings:
+            if row["instance_id"] == self.instance_id and row["rank_id"] == 0:
+                self._system_mappings.setdefault(row["request_id"], []).append(row)
+        pools = {row["logical_tier"]: row for row in state.pools
+                 if row["instance_id"] == self.instance_id and row["rank_id"] in (0, None)}
+        l1, l2 = pools["L1"], pools["L2"]
+        self.npu_mem = min(self.npu_mem, l1["capacity_bytes"] + self.resident_weight)
+        self.npu_used = l1["used_bytes"] + l1["reserved_bytes"] + self.resident_weight
+        self.cpu_mem = min(self.cpu_mem, l2["capacity_bytes"])
+        self.cpu_used = l2["used_bytes"] + l2["reserved_bytes"]
+        self._system_active_ids = {req.id for req in active_requests if not req.evict}
+        active = {row["object_uid"] for req in active_requests if not req.evict
+                  for row in self._system_mappings.get(req.id, ())}
+        self._system_reclaimable = sum(obj["size_bytes"] for uid, obj in self._system_objects.items()
+            if uid not in active and l1["pool_id"] in obj["ready_pool_ids"])
+
+    def _system_growth(self, requests, scheduled_tokens):
+        """Additional L1 bytes for a native candidate batch; aliases count once."""
+        restored, growth = set(), 0
+        for req in requests:
+            rows = self._system_mappings.get(req.id, ())
+            if not rows and req.prefix_cache_source_request_id is not None:
+                rows = self._system_mappings.get(req.prefix_cache_source_request_id, ())
+            mapped = 0
+            for row in rows:
+                count = max(0, min(req.num_computed_tokens, row["token_start"] + row["token_count"]) - row["token_start"])
+                if not count:
+                    continue
+                obj = self._system_objects[row["object_uid"]]
+                if not obj["ready_pool_ids"]:
+                    continue
+                mapped += row["size_bytes"] * count // row["token_count"]
+                if req.id in self._system_evicted or not any(pool.endswith(":L1") for pool in obj["ready_pool_ids"]):
+                    restored.add(row["object_uid"])
+            after = req.num_computed_tokens + scheduled_tokens[req.id]
+            full = self.get_kv((after + self.block_size - 1) // self.block_size * self.block_size)
+            growth += max(0, full - mapped)
+        return growth + sum(self._system_objects[uid]["size_bytes"] for uid in restored)
+
+    def prefix_availability(self, req):
+        """Resolve an explicit prefix source from the last system snapshot."""
+        source = req.prefix_cache_source_request_id
+        if self.system_state is None or source is None:
+            return {}
+        objects = {row["object_uid"]: row for row in self.system_state.kv_objects}
+        ranges = {}
+        limit = int(req.prefix_cache_hit)
+        for row in self.system_state.kv_mappings:
+            if row["instance_id"] != self.instance_id or row["request_id"] != source:
+                continue
+            key = (row["rank_id"], row["layer_id"])
+            ranges.setdefault(key, []).append(row)
+        ranks = {row["rank_id"] for row in self.system_state.pools
+                 if row["instance_id"] == self.instance_id and row["logical_tier"] == "L1"}
+        required = {(rank, layer) for rank in ranks for layer in self.system_state.kv_layer_ids}
+        hits, local_hits = [], []
+        for key in required:
+            rows = ranges.get(key, ())
+            end = local_end = 0
+            for row in sorted(rows, key=lambda item: item["token_start"]):
+                pools = objects[row["object_uid"]]["ready_pool_ids"]
+                if not pools or row["token_start"] > end:
+                    break
+                end = max(end, row["token_start"] + row["token_count"])
+                if row["token_start"] <= local_end and any(pool.endswith(":L1") for pool in pools):
+                    local_end = max(local_end, row["token_start"] + row["token_count"])
+            hits.append(min(limit, end))
+            local_hits.append(min(limit, local_end))
+        hit = min(hits, default=0)
+        local = min(local_hits, default=0)
+        return dict(prefix_cache_hit=hit, npu_cache_hit=local,
+                    storage_cache_hit=hit if hit > local else 0,
+                    restore_prefix_to_l1=hit > local)
 
     @property
     def _l2_size_scale(self):
@@ -168,7 +249,7 @@ class MemoryModel():
 
     def reserve_logical_batch(self, requests, scheduled_tokens):
         """Reserve inclusive L2 backing and record active L1 membership."""
-        if not self.l2_retains_l1 or self.hbframe_pool_snapshot is not None:
+        if not self.l2_retains_l1 or self.system_state is not None:
             return
         updates = []
         added_l2 = 0
@@ -239,6 +320,8 @@ class MemoryModel():
         self._l2_request_bytes[request_id] = max(previous, active_bytes)
 
     def deactivate_l1(self, request_id):
+        if self.system_state is not None:
+            self._system_evicted.add(request_id)
         if self.l2_retains_l1:
             self._l1_request_bytes.pop(int(request_id), None)
 
@@ -304,8 +387,6 @@ class MemoryModel():
         self.cpu_used -= released
 
     def logical_pool_snapshot(self):
-        if self.hbframe_pool_snapshot is not None:
-            return self.hbframe_pool_snapshot(self)
         l1_kv_used = max(0, int(self.npu_used) - int(self.resident_weight))
         overlap = 0
         if self.l2_retains_l1:
@@ -413,6 +494,8 @@ class MemoryModel():
     #   blocks_before = ceil(computed / block_size) if computed > 0 else 0
     #   new_blocks = blocks_after - blocks_before
     def get_block_kv(self, batch_req, batch_len, scheduled_tokens=None):
+        if self.system_state is not None and self.require_local_kv:
+            return self._system_growth(batch_req[:batch_len], scheduled_tokens)
         # print("[get_block_kv] current batch_req length : {}".format(batch_len))
         block_kv_size = 0
         for i in range(batch_len):
@@ -456,6 +539,13 @@ class MemoryModel():
     
     # get size of kv cache that should be evicted
     def get_evict_kv(self, req):
+        if self.system_state is not None:
+            shared = {row["object_uid"] for rid in self._system_active_ids - {req.id} - self._system_evicted
+                      for row in self._system_mappings.get(rid, ())}
+            owned = {row["object_uid"] for row in self._system_mappings.get(req.id, ())} - shared
+            tier = ":L2" if req.evict else ":L1"
+            return sum(self._system_objects[uid]["size_bytes"] for uid in owned
+                       if any(pool.endswith(tier) for pool in self._system_objects[uid]["ready_pool_ids"]))
         evict_size = 0
         # Use num_computed_tokens if available, fallback to input for backwards compat
         computed = req.num_computed_tokens
@@ -501,8 +591,6 @@ class MemoryModel():
     # -------------------- Memory Management --------------------
     
     def allocate(self, size, device):
-        if self.hbframe_pool_snapshot is not None:
-            return
         if device == Device.NPU:
             if self.npu_used + size > self.npu_mem:
                 raise RuntimeError(
@@ -537,8 +625,6 @@ class MemoryModel():
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to allocate KV cache in unsupported device {device}")
     
     def free(self, size, device):
-        if self.hbframe_pool_snapshot is not None:
-            return
         if device == Device.NPU:
             if self.npu_used - size < self.resident_weight:
                 raise RuntimeError(
@@ -614,6 +700,8 @@ class MemoryModel():
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to check available size of unsupported device {device}")
 
     def avail_size(self, device):
+        if self.system_state is not None:
+            return self.avail_bytes(device)
         if not self.enable_prefix_caching:
             return 0
         
@@ -635,6 +723,8 @@ class MemoryModel():
             self.apply_kv_cache_events()
 
     def evictable_size(self, device):
+        if self.system_state is not None and device == Device.NPU:
+            return self._system_reclaimable
         if not self.enable_prefix_caching:
             return 0
         
@@ -750,6 +840,10 @@ class MemoryModel():
         self.apply_kv_cache_events()
 
     def evict_prefix_cache(self, bytes, device):
+        if self.system_state is not None and device == Device.NPU:
+            self._system_reclaimable -= bytes
+            self.npu_used -= bytes
+            return
         if not self.enable_prefix_caching or bytes <= 0:
             return
 
@@ -826,8 +920,7 @@ class MemoryModel():
     
     # Count load/unload events from prefix cache and update memory usage
     def apply_kv_cache_events(self):
-        if self.hbframe_pool_snapshot is not None:
-            # Radix retains token matching metadata; MemoryService owns placement.
+        if self.system_state is not None:
             self.npu_prefix_cache.take_events()
             if self.prefix_storage is not None:
                 self.second_tier_prefix_cache.take_events()

@@ -23,6 +23,7 @@ class HBFrameFrontendConfig:
     """Minimal single-instance configuration for HBFrame serving export."""
 
     model: str
+    require_local_kv: bool = False
     max_num_seqs: int = 128
     max_num_batched_tokens: int = 2048
     long_prefill_token_threshold: int = 0
@@ -212,7 +213,7 @@ def snapshot_batch(batch, scheduler: Scheduler, *, extra_attrs=None) -> HBFrameB
 class HBFrameServingFrontend:
     """Callable LLMServingSim scheduler wrapper for HBFrame."""
 
-    def __init__(self, config: HBFrameFrontendConfig, scheduler_oracle=None):
+    def __init__(self, config: HBFrameFrontendConfig):
         self.config = config
         prefix_storage = _prefix_storage_device(config.prefix_storage)
         self.schedulers = []
@@ -263,13 +264,7 @@ class HBFrameServingFrontend:
                     scheduler.memory.mem_for_kv = max(0, scheduler.memory.npu_mem - resident_weight)
                     if hasattr(scheduler.memory, "npu_prefix_cache"):
                         scheduler.memory.npu_prefix_cache.capacity = scheduler.memory.mem_for_kv
-            scheduler.hbframe_oracle = scheduler_oracle
-            if (scheduler_oracle is not None
-                    and hasattr(scheduler_oracle, "frontend_pool_snapshot")
-                    and scheduler_oracle.config.scheduler_admission_enabled
-                    and scheduler_oracle.config.kv_management_policy in {
-                        "external_block_group_lru", "peer_replicated_balanced", "peer_replicated_capacity"}):
-                scheduler.memory.hbframe_pool_snapshot = scheduler_oracle.frontend_pool_snapshot
+            scheduler.memory.require_local_kv = config.require_local_kv
             return scheduler
 
         if str(config.pd_mode).lower() == "disaggregated":
@@ -325,8 +320,8 @@ class HBFrameServingFrontend:
     def pd_disaggregated(self) -> bool:
         return str(self.config.pd_mode).lower() == "disaggregated"
 
-    def load_requests(self, path: str | Path) -> None:
-        """Load a JSONL workload path without depending on ``astra-sim`` cwd."""
+    def load_requests(self, path: str | Path) -> tuple[dict[str, object], ...]:
+        """Load workload and return normalized history for Host materialization."""
         path = Path(path)
         if not path.is_absolute():
             repo_root = Path(__file__).resolve().parents[2]
@@ -354,6 +349,7 @@ class HBFrameServingFrontend:
                     self.router._load_flat_request(row, self.config.enable_prefix_caching)
                 loaded_requests += 1
         self.router._pending_requests.sort(key=lambda request: request["arrival_time_ns"])
+        return tuple(dict(request) for request in self._initial_requests)
 
     def _annotate_initialized_decode_resume(
         self,
@@ -438,11 +434,6 @@ class HBFrameServingFrontend:
                 input_tokens + output_tokens,
                 shared_tokens=prefix_hit,
             )
-
-    @property
-    def initial_requests(self) -> tuple[dict[str, object], ...]:
-        """Historical requests to materialize before the serving timeline starts."""
-        return tuple(dict(request) for request in self._initial_requests)
 
     def route_arrivals(self, current_time_ns: int) -> int:
         self.current_time_ns = int(current_time_ns)
