@@ -641,7 +641,6 @@ class Scheduler:
                         if req.is_prefill() and req._prefix_locked:
 
                             self.memory.unlock_prefix(req, Device.NPU)
-                            self.memory.erase_prefix_info(req)
                             req._prefix_locked = False
                     return None
 
@@ -690,10 +689,11 @@ class Scheduler:
                         break
 
             # Unlock prefix for requests that didn't make it into the batch
+            # A released lock does not undo the resolved prefix or its pending
+            # L2 restore; both are still needed when the request is admitted.
             for req in batch_req[temp_len:]:
                 if req.is_prefill() and req._prefix_locked:
                     self.memory.unlock_prefix(req, Device.NPU)
-                    self.memory.erase_prefix_info(req)
                     req._prefix_locked = False
 
             batch_len = temp_len
