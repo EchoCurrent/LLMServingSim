@@ -23,6 +23,8 @@ class HBFrameFrontendConfig:
     """Minimal single-instance configuration for HBFrame serving export."""
 
     model: str
+    model_config: dict[str, object] | None = None
+    rank_memory: dict[int, dict[str, int]] | None = None
     require_local_kv: bool = False
     max_num_seqs: int = 128
     max_num_batched_tokens: int = 2048
@@ -255,6 +257,8 @@ class HBFrameServingFrontend:
                 l2_retains_l1=config.l2_retains_l1,
                 l2_scope=config.l2_scope,
                 kv_eviction_has_fallback=config.kv_eviction_has_fallback,
+                model_config=config.model_config,
+                rank_memory=config.rank_memory,
             )
             if config.npu_kv_capacity_mb is not None:
                 kv_bytes = int(float(config.npu_kv_capacity_mb) * 1024 * 1024)
@@ -428,12 +432,13 @@ class HBFrameServingFrontend:
         # A request's KV covers its whole sequence, matching ``get_kv``, so the
         # history charge is the prompt plus the generated tokens the next turn
         # reuses, less whatever prefix this request shares with its source.
-        for scheduler in self.schedulers:
-            scheduler.memory.reserve_initial_request(
-                request_id,
-                input_tokens + output_tokens,
-                shared_tokens=prefix_hit,
-            )
+        if self.config.rank_memory is None:
+            for scheduler in self.schedulers:
+                scheduler.memory.reserve_initial_request(
+                    request_id,
+                    input_tokens + output_tokens,
+                    shared_tokens=prefix_hit,
+                )
 
     def route_arrivals(self, current_time_ns: int) -> int:
         self.current_time_ns = int(current_time_ns)

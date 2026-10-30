@@ -285,11 +285,8 @@ class Router:
             if resume_decode:
                 new_req.num_computed_tokens = int(new_req.original_input)
                 new_req._prefix_resolved = True
-            for name in (
-                'prefix_cache_source_request_id',
-            ):
-                if name in req_data:
-                    setattr(new_req, name, req_data[name])
+            new_req.prefix_cache_source_request_id = req_data.get('prefix_cache_source_request_id')
+            new_req.declared_prefix_source_request_id = new_req.prefix_cache_source_request_id
 
             self._pending_idx += 1
             routed += 1

@@ -99,6 +99,9 @@ class TreeNode:
         # incremented when the node is referenced by a storage operation
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        # A donor request identifies the complete token path to this node.
+        # Native storage snapshots determine whether its KV still exists.
+        self.source_request_id: Optional[int] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -275,9 +278,9 @@ class RadixCache():
                 hit_length=hit_length,
             )
 
-    def insert(self, key: List, value=None):
+    def insert(self, key: List, value=None, *, source_request_id=None):
         # input: page-size aligned prefix token ids from request
-        return self._insert_helper(self.root_node, key)
+        return self._insert_helper(self.root_node, key, source_request_id)
 
     def cache_finished_req(self, req):
         """Cache request when it finishes."""
@@ -292,7 +295,7 @@ class RadixCache():
                 page_aligned_len = len(token_ids)
 
             # Radix Cache takes one ref in memory pool
-            new_prefix_len = self.insert(token_ids[:page_aligned_len])
+            new_prefix_len = self.insert(token_ids[:page_aligned_len], source_request_id=req.id)
 
     def cache_unfinished_req(self, req, update=True):
         """Cache request when it is unfinished."""
@@ -311,7 +314,7 @@ class RadixCache():
             insert_token_ids = token_ids[:page_aligned_len]
 
             # Radix Cache takes one ref in memory pool
-            new_prefix_len = self.insert(insert_token_ids)
+            new_prefix_len = self.insert(insert_token_ids, source_request_id=req.id)
             # print("[radix_tree: insert()] req_id: {}, insert_len: {}, total_size_after: {}, new_prefix_len: {}".format(req.id, len(insert_token_ids), self.total_size(), new_prefix_len))
 
             # Track prefix cache stats on first insert (is_init=True, before it's cleared)
@@ -478,6 +481,7 @@ class RadixCache():
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
+        new_node.source_request_id = child.source_request_id
 
         child.parent = new_node
         child.key = child.key[split_len:]
@@ -506,7 +510,7 @@ class RadixCache():
         child_hash = child_hash_value[split_pages:]
         return new_node_hash, child_hash
     
-    def _insert_helper(self, node: TreeNode, key: List):
+    def _insert_helper(self, node: TreeNode, key: List, source_request_id=None):
         # node : self.root_node, key: token_ids (to insert)
         node.last_access_time = time.monotonic()
         if len(key) == 0:
@@ -527,6 +531,9 @@ class RadixCache():
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
 
+            if source_request_id is not None:
+                node.source_request_id = source_request_id
+
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
@@ -534,6 +541,7 @@ class RadixCache():
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
+            new_node.source_request_id = source_request_id
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             # print(f"[RADIX_INSERT] new_leaf node_id={new_node.id} key_len={len(key)} parent_id={node.id}")
