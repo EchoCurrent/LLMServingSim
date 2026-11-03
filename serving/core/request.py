@@ -23,6 +23,7 @@ class Request:
         self.is_init = is_init
         self.original_input = input
         self.num_computed_tokens = 0  # Tracks actual computed tokens (vLLM style)
+        self.has_executed = False
         self.evict = False
         self.end_time = -1
         self.latency = -1
@@ -43,6 +44,7 @@ class Request:
         self.storage_cache_hit = self.declared_prefix_cache_hit
         self.prefix_cache_hit = max(self.npu_cache_hit, self.storage_cache_hit)
         self.prefix_cache_source_request_id = None if prefix_cache_source_request_id is None else int(prefix_cache_source_request_id)
+        self.declared_prefix_source_request_id = self.prefix_cache_source_request_id
         self.npu_last_node = None
         self.cpu_last_node = None
         self.storage_last_node = None
@@ -50,6 +52,7 @@ class Request:
         # For prefix cache lock tracking
         self._prefix_locked = False
         self._prefix_resolved = False
+        self._prefix_state_version = -1
         self.hbframe_prefix_restore_pending = False
 
         # An HBFrame initialize_only history can restore an already-active

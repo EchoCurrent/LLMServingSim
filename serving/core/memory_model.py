@@ -57,8 +57,17 @@ class Device(Enum):
     CPU = 2
     CXL = 3
 
+
+def _union_bytes(ranges):
+    end = total = 0
+    for left, right in sorted(ranges):
+        total += max(0, right - max(left, end))
+        end = max(end, right)
+    return total
+
+
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', weight_residency='npu', l2_retains_l1=False, l2_scope='node', kv_eviction_has_fallback=True):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', weight_residency='npu', l2_retains_l1=False, l2_scope='node', kv_eviction_has_fallback=True, model_config=None, rank_memory=None):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -88,7 +97,8 @@ class MemoryModel():
         # dropped rather than reloaded.
         self._initial_request_ids = set()
 
-        self.config = get_config(model)
+        self.config = get_config(model) if model_config is None else model_config
+        self.rank_memory = rank_memory
         self.n_embd = self.config['hidden_size']
         self.n_layer = self.config['num_hidden_layers']
         self.n_head = self.config['num_attention_heads']
@@ -109,7 +119,8 @@ class MemoryModel():
         # Memory model. The default preserves LLMServingSim's original
         # assumption that full weights are resident on NPU memory. HBFrame can
         # explicitly request offloaded weights and model weight movement itself.
-        self.weight = self.get_weight()
+        self.weight = (rank_memory[min(rank_memory)]['weight_bytes']
+                       if rank_memory is not None else self.get_weight())
         self.weight_residency = str(weight_residency or 'npu').lower()
         npu_resident_modes = {'npu', 'hbm', 'resident', 'resident_npu'}
         offloaded_modes = {'offload', 'offloaded', 'streaming', 'external', 'hbf', 'ssd', 'cpu'}
@@ -165,48 +176,180 @@ class MemoryModel():
 
     def update_system_state(self, state, active_requests):
         """Rebase the native ledger from a quiescent, data-only system snapshot."""
+        self._system_active_requests = tuple(active_requests)
+        if self.system_state is None:
+            self._system_l1_limit = self.npu_mem - self.resident_weight
+            self._system_l2_limit = self.cpu_mem
         self.system_state = state
         self._system_evicted = set()
         self._system_objects = {row["object_uid"]: row for row in state.kv_objects}
         self._system_mappings = {}
         for row in state.kv_mappings:
-            if row["instance_id"] == self.instance_id and row["rank_id"] == 0:
-                self._system_mappings.setdefault(row["request_id"], []).append(row)
-        pools = {row["logical_tier"]: row for row in state.pools
-                 if row["instance_id"] == self.instance_id and row["rank_id"] in (0, None)}
-        l1, l2 = pools["L1"], pools["L2"]
-        self.npu_mem = min(self.npu_mem, l1["capacity_bytes"] + self.resident_weight)
-        self.npu_used = l1["used_bytes"] + l1["reserved_bytes"] + self.resident_weight
-        self.cpu_mem = min(self.cpu_mem, l2["capacity_bytes"])
-        self.cpu_used = l2["used_bytes"] + l2["reserved_bytes"]
-        self._system_active_ids = {req.id for req in active_requests if not req.evict}
-        active = {row["object_uid"] for req in active_requests if not req.evict
-                  for row in self._system_mappings.get(req.id, ())}
-        self._system_reclaimable = sum(obj["size_bytes"] for uid, obj in self._system_objects.items()
-            if uid not in active and l1["pool_id"] in obj["ready_pool_ids"])
+            if row["instance_id"] == self.instance_id:
+                self._system_mappings.setdefault((row["rank_id"], row["request_id"]), []).append(row)
+        self._system_pools = {row["pool_id"]: {**row,
+            "capacity_bytes": min(row["capacity_bytes"], self._system_l1_limit
+                if row["logical_tier"] == "L1" else self._system_l2_limit),
+            "used_bytes": row["used_bytes"] + row["reserved_bytes"]}
+            for row in state.pools if row["instance_id"] == self.instance_id}
+        self._system_l1 = {row["rank_id"]: row for row in self._system_pools.values()
+                           if row["logical_tier"] == "L1"}
+        self._system_l2 = {row["rank_id"]: row for row in self._system_pools.values()
+                           if row["logical_tier"] == "L2"}
+        self._system_pool_objects = {pid: {uid for uid, obj in self._system_objects.items()
+            if pid in obj["ready_pool_ids"]} for pid in self._system_pools}
+        # Identity projections charge object bytes. Replicated views publish
+        # overrides so readable backing is not mistaken for reclaimable space.
+        self._system_pool_charges = {pid: {uid: obj.get("pool_charge_bytes", {}).get(pid, obj["size_bytes"])
+            for uid, obj in self._system_objects.items()
+            if pid in obj["ready_pool_ids"] or pid in obj.get("pool_charge_bytes", {})}
+            for pid in self._system_pools}
+        self._system_active_ids = {req.id for req in self._system_active_requests if not req.evict}
+        self._system_live_ids = {req.id for req in self._system_active_requests}
+        self._refresh_system_reclaimable()
+        self._sync_system_ledger()
+
+    def _refresh_system_reclaimable(self):
+        self._system_cold_objects = {}
+        for pid, charges in self._system_pool_charges.items():
+            protected_ids = (self._system_live_ids if self._system_pools[pid]["logical_tier"] == "L2"
+                             else self._system_active_ids - self._system_evicted)
+            protected = {row["object_uid"] for (rank, rid), rows in self._system_mappings.items()
+                         if rid in protected_ids for row in rows}
+            self._system_cold_objects[pid] = charges.keys() - protected
+        self._system_cold_bytes = {pid: sum(self._system_pool_charges[pid][uid] for uid in objects)
+                                   for pid, objects in self._system_cold_objects.items()}
+
+    def _sync_system_ledger(self):
+        """Expose one rank's ledger for observations; admission checks every pool."""
+        self._system_reference_rank = min(self._system_l1)
+        l1 = self._system_l1[self._system_reference_rank]
+        l2 = self._system_l2.get(self._system_reference_rank, self._system_l2.get(None))
+        self.npu_mem = l1["capacity_bytes"] + self.resident_weight
+        self.npu_used = l1["used_bytes"] + self.resident_weight
+        self.cpu_mem, self.cpu_used = l2["capacity_bytes"], l2["used_bytes"]
+
+    def _system_batch_space(self, requests, scheduled_tokens):
+        """Count new bytes and the union of restored ranges in each logical pool."""
+        growth = {pid: 0 for pid in self._system_pools}
+        data_growth = {pid: 0 for pid, pool in self._system_pools.items() if "data_capacity_bytes" in pool}
+        protected = set()
+        for rank, pool in self._system_l1.items():
+            pid = pool["pool_id"]
+            restored = {}
+            restored_slack = {}
+            scale = pool.get("allocation_charge_scale", 1)
+            unit = self.get_kv(1) if self.rank_memory is None else self.rank_memory[rank]['kv_bytes_per_token']
+            for req in requests:
+                rows = self._system_mappings.get((rank, req.id), ())
+                if not rows and req.prefix_cache_source_request_id is not None:
+                    rows = self._system_mappings.get((rank, req.prefix_cache_source_request_id), ())
+                mapped = 0
+                slack = 0
+                continuation = {}
+                boundary = req.num_computed_tokens // self.block_size * self.block_size
+                for row in rows:
+                    count = max(0, min(req.num_computed_tokens,
+                        row["token_start"] + row["token_count"]) - row["token_start"])
+                    uid = row["object_uid"]
+                    if not count or not self._system_objects[uid]["ready_pool_ids"]:
+                        continue
+                    size = row["size_bytes"] * count // row["token_count"]
+                    mapped += size
+                    if (row["token_start"] <= boundary < row["token_start"] + count
+                            and "append_retains_allocation" in row):
+                        continuation[row["layer_id"]] = row["append_retains_allocation"]
+                    owned_slack = (row.get("reserved_bytes", 0) if row["request_id"] == req.id
+                                   and count == row["token_count"] else 0)
+                    slack += owned_slack
+                    protected.add(uid)
+                    if uid not in self._system_pool_objects[pid]:
+                        offset = row["object_offset_bytes"]
+                        restored.setdefault(uid, []).append((offset, offset + size))
+                        restored_slack[uid] = max(restored_slack.get(uid, 0), owned_slack)
+                after = req.num_computed_tokens + scheduled_tokens[req.id]
+                full = (after + self.block_size - 1) // self.block_size * self.block_size * unit
+                added = max(0, full - mapped - slack)
+                if pid in data_growth:
+                    data_growth[pid] += added
+                fraction = pool.get("streaming_allocation_fraction")
+                count = scheduled_tokens[req.id]
+                if fraction is not None and count >= 4 * self.block_size:
+                    # Streaming allocations release completed units while the
+                    # retained prefix and unfinished boundary units stay live.
+                    start = req.num_computed_tokens
+                    end = start + count
+                    block = self.block_size
+                    retained = round(count * fraction / block) * block
+                    retained_end = min(end, max(start, (start + retained + block // 2) // block * block))
+                    head_end = min(end, (start + block - 1) // block * block)
+                    live = max(head_end, retained_end) - start
+                    live += max(0, (end + block - 1) // block * block
+                                - max(head_end, retained_end, end // block * block))
+                    charge = max(0, live * unit - slack)
+                else:
+                    charge = added
+                    distribution = pool.get("allocation_distribution")
+                    if distribution is not None and added:
+                        # A published allocation unit may be released after
+                        # filling. Charge its peak footprint, not an average
+                        # fraction of the requested data bytes.
+                        first = full // unit - added // unit
+                        charge = 0
+                        for allocation in distribution["units"]:
+                            live = peak = 0
+                            for left in range(first // self.block_size * self.block_size,
+                                              full // unit, self.block_size):
+                                size = (min(left+self.block_size, full//unit) - max(left, first))
+                                peak = max(peak, live + size)
+                                ordinal = max(0, req.id) + allocation["phase"] + left // self.block_size
+                                released = distribution["released_weight"]
+                                total = distribution["total_weight"]
+                                closes = left + self.block_size <= after
+                                retain = (ordinal+1)*released//total == ordinal*released//total
+                                if left == boundary and allocation["layer_id"] in continuation:
+                                    retain = continuation[allocation["layer_id"]]
+                                if not closes or retain:
+                                    live += size
+                            charge += peak * allocation["bytes_per_token"]
+                growth[pid] += int(charge * scale)
+                if self.l2_retains_l1:
+                    backing = self._system_l2.get(rank, self._system_l2.get(None))
+                    growth[backing["pool_id"]] += added
+            for uid, ranges in restored.items():
+                obj = self._system_objects[uid]
+                cost = obj.get("restore_charge_bytes", {}).get(pid, obj["size_bytes"] * scale)
+                growth[pid] += int(_union_bytes(ranges) * cost / obj["size_bytes"]
+                                         + restored_slack[uid] * scale)
+                if pid in data_growth:
+                    data_growth[pid] += _union_bytes(ranges) + restored_slack[uid]
+        reclaimable = {pid: min(pool["used_bytes"], self._system_cold_bytes[pid]
+            - sum(self._system_pool_charges[pid][uid] for uid in protected & self._system_cold_objects[pid]))
+            for pid, pool in self._system_pools.items()}
+        data_demand = {pid: (added, sum(self._system_objects[uid].get("allocation_bytes",
+            self._system_objects[uid]["size_bytes"]) for uid in self._system_cold_objects[pid] - protected
+            if uid in self._system_pool_objects[pid])) for pid, added in data_growth.items()}
+        return growth, reclaimable, data_demand
 
     def _system_growth(self, requests, scheduled_tokens):
         """Additional L1 bytes for a native candidate batch; aliases count once."""
-        restored, growth = set(), 0
-        for req in requests:
-            rows = self._system_mappings.get(req.id, ())
-            if not rows and req.prefix_cache_source_request_id is not None:
-                rows = self._system_mappings.get(req.prefix_cache_source_request_id, ())
-            mapped = 0
-            for row in rows:
-                count = max(0, min(req.num_computed_tokens, row["token_start"] + row["token_count"]) - row["token_start"])
-                if not count:
-                    continue
-                obj = self._system_objects[row["object_uid"]]
-                if not obj["ready_pool_ids"]:
-                    continue
-                mapped += row["size_bytes"] * count // row["token_count"]
-                if req.id in self._system_evicted or not any(pool.endswith(":L1") for pool in obj["ready_pool_ids"]):
-                    restored.add(row["object_uid"])
-            after = req.num_computed_tokens + scheduled_tokens[req.id]
-            full = self.get_kv((after + self.block_size - 1) // self.block_size * self.block_size)
-            growth += max(0, full - mapped)
-        return growth + sum(self._system_objects[uid]["size_bytes"] for uid in restored)
+        growth, _, _ = self._system_batch_space(requests, scheduled_tokens)
+        return growth[self._system_l1[self._system_reference_rank]["pool_id"]]
+
+    def batch_memory(self, requests, scheduled_tokens, *, reclaim_prefix=False):
+        """Return admission and representative byte demand for a candidate batch."""
+        if self.system_state is None:
+            size = self.get_block_kv(requests, len(requests), scheduled_tokens)
+            available = self.avail_bytes(Device.NPU)
+            if reclaim_prefix:
+                available = self.avail_size(Device.NPU) + self.evictable_size(Device.NPU)
+            return size <= available, size
+        growth, reclaimable, data_demand = self._system_batch_space(requests, scheduled_tokens)
+        fits = all(pool["used_bytes"] + growth[pid] - reclaimable[pid] <= pool["capacity_bytes"]
+                   for pid, pool in self._system_pools.items())
+        fits = fits and all(self._system_pools[pid]["data_used_bytes"] + added - cold
+            <= self._system_pools[pid]["data_capacity_bytes"] for pid, (added, cold) in data_demand.items())
+        return fits, growth[self._system_l1[self._system_reference_rank]["pool_id"]]
 
     def prefix_availability(self, req):
         """Resolve an explicit prefix source from the last system snapshot."""
@@ -249,7 +392,22 @@ class MemoryModel():
 
     def reserve_logical_batch(self, requests, scheduled_tokens):
         """Reserve inclusive L2 backing and record active L1 membership."""
-        if not self.l2_retains_l1 or self.system_state is not None:
+        if self.system_state is not None:
+            growth, reclaimable, data_demand = self._system_batch_space(requests, scheduled_tokens)
+            for pid, pool in self._system_pools.items():
+                deficit = max(0, pool["used_bytes"] + growth[pid] - pool["capacity_bytes"])
+                if deficit > reclaimable[pid]:
+                    raise RuntimeError(f"Candidate exceeds logical pool {pid}")
+                pool["used_bytes"] += growth[pid] - deficit
+            for pid, (added, cold) in data_demand.items():
+                pool = self._system_pools[pid]
+                deficit = max(0, pool["data_used_bytes"] + added - pool["data_capacity_bytes"])
+                if deficit > cold:
+                    raise RuntimeError(f"Candidate exceeds logical data capacity {pid}")
+                pool["data_used_bytes"] += added - deficit
+            self._sync_system_ledger()
+            return
+        if not self.l2_retains_l1:
             return
         updates = []
         added_l2 = 0
@@ -322,6 +480,23 @@ class MemoryModel():
     def deactivate_l1(self, request_id):
         if self.system_state is not None:
             self._system_evicted.add(request_id)
+            for rank, pool in self._system_l1.items():
+                owned = self._system_exclusive_objects(rank, request_id)
+                removed = owned & self._system_pool_charges[pool["pool_id"]].keys()
+                if "data_used_bytes" in pool:
+                    pool["data_used_bytes"] -= sum(self._system_objects[uid].get("allocation_bytes",
+                        self._system_objects[uid]["size_bytes"]) for uid in removed
+                        if uid in self._system_pool_objects[pool["pool_id"]])
+                freed = min(pool["used_bytes"], sum(self._system_pool_charges[pool["pool_id"]][uid] for uid in removed))
+                pool["used_bytes"] -= freed
+                self._system_pool_objects[pool["pool_id"]].difference_update(removed)
+                for uid in removed:
+                    del self._system_pool_charges[pool["pool_id"]][uid]
+                if self.kv_eviction_has_fallback and not self.l2_retains_l1:
+                    l2 = self._system_l2.get(rank, self._system_l2.get(None))
+                    l2["used_bytes"] += freed
+            self._refresh_system_reclaimable()
+            self._sync_system_ledger()
         if self.l2_retains_l1:
             self._l1_request_bytes.pop(int(request_id), None)
 
@@ -333,6 +508,9 @@ class MemoryModel():
         dropped the same way, which is why it is tracked separately.
         """
         request_id = int(request_id)
+        if self.system_state is not None:
+            self.deactivate_l1(request_id)
+            return
         released = int(self._l1_request_bytes.pop(request_id, 0))
         self._initial_request_ids.discard(request_id)
         if released > 0:
@@ -389,7 +567,15 @@ class MemoryModel():
     def logical_pool_snapshot(self):
         l1_kv_used = max(0, int(self.npu_used) - int(self.resident_weight))
         overlap = 0
-        if self.l2_retains_l1:
+        if self.system_state is not None:
+            l1 = self._system_l1[self._system_reference_rank]
+            l2 = self._system_l2.get(self._system_reference_rank, self._system_l2.get(None))
+            paired = sum(self._system_objects[uid]["size_bytes"] for uid in
+                self._system_pool_objects[l1["pool_id"]] & self._system_pool_objects[l2["pool_id"]])
+            # Balanced L1 charges the active HBM working footprint in logical
+            # bytes; readable cold HBF backing can exceed that active footprint.
+            overlap = min(l1_kv_used, l2["used_bytes"], paired)
+        elif self.l2_retains_l1:
             overlap = min(
                 l1_kv_used,
                 sum(
@@ -472,10 +658,13 @@ class MemoryModel():
             block_weight += ffn2_w
         return block_weight
 
-    def get_kv(self, seq):
+    def get_kv(self, seq, rank_id=None):
+        if self.rank_memory is not None:
+            rank = min(self.rank_memory) if rank_id is None else rank_id
+            return seq * self.rank_memory[rank]['kv_bytes_per_token']
         # MLA latent KV is replicated across TP ranks; only PP shards layers.
         kv_factor = 1 if self.uses_mla else 2
-        divisor = self.pp_size if self.uses_mla else self.num_npus
+        divisor = self.pp_size if self.uses_mla else self.pp_size * min(self.tp_size, self.kv_head)
         return kv_factor * self.kv_dim * seq * self.n_layer * self.kv_fp // divisor
     
     # get the total size of current kv cache for the request
@@ -494,7 +683,7 @@ class MemoryModel():
     #   blocks_before = ceil(computed / block_size) if computed > 0 else 0
     #   new_blocks = blocks_after - blocks_before
     def get_block_kv(self, batch_req, batch_len, scheduled_tokens=None):
-        if self.system_state is not None and self.require_local_kv:
+        if self.system_state is not None:
             return self._system_growth(batch_req[:batch_len], scheduled_tokens)
         # print("[get_block_kv] current batch_req length : {}".format(batch_len))
         block_kv_size = 0
@@ -537,12 +726,28 @@ class MemoryModel():
                     block_kv_size += self.get_kv(self.block_size)
         return block_kv_size
     
-    # get size of kv cache that should be evicted
+    def _system_exclusive_objects(self, rank, request_id):
+        active = self._system_active_ids - {request_id} - self._system_evicted
+        shared = {row["object_uid"] for rid in active
+                  for row in self._system_mappings.get((rank, rid), ())}
+        return {row["object_uid"] for row in self._system_mappings.get((rank, request_id), ())} - shared
+
+    def can_evict(self, req):
+        """A victim must release working capacity in at least one maintained pool."""
+        if self.system_state is None:
+            return self.get_evict_kv(req) > 0
+        for rank, pool in self._system_l1.items():
+            pid = pool["pool_id"]
+            for uid in self._system_exclusive_objects(rank, req.id):
+                if self._system_pool_charges[pid].get(uid, 0) > 0 or (
+                        "data_capacity_bytes" in pool and uid in self._system_pool_objects[pid]):
+                    return True
+        return False
+
+    # Logical payload bytes on the representative rank, separate from victim eligibility.
     def get_evict_kv(self, req):
         if self.system_state is not None:
-            shared = {row["object_uid"] for rid in self._system_active_ids - {req.id} - self._system_evicted
-                      for row in self._system_mappings.get(rid, ())}
-            owned = {row["object_uid"] for row in self._system_mappings.get(req.id, ())} - shared
+            owned = self._system_exclusive_objects(self._system_reference_rank, req.id)
             tier = ":L2" if req.evict else ":L1"
             return sum(self._system_objects[uid]["size_bytes"] for uid in owned
                        if any(pool.endswith(tier) for pool in self._system_objects[uid]["ready_pool_ids"]))
@@ -724,7 +929,8 @@ class MemoryModel():
 
     def evictable_size(self, device):
         if self.system_state is not None and device == Device.NPU:
-            return self._system_reclaimable
+            _, reclaimable, _ = self._system_batch_space((), {})
+            return reclaimable[self._system_l1[self._system_reference_rank]["pool_id"]]
         if not self.enable_prefix_caching:
             return 0
         
@@ -841,8 +1047,8 @@ class MemoryModel():
 
     def evict_prefix_cache(self, bytes, device):
         if self.system_state is not None and device == Device.NPU:
-            self._system_reclaimable -= bytes
-            self.npu_used -= bytes
+            # Native batch admission reserves against all pools and protects
+            # the selected prefix ranges in reserve_logical_batch().
             return
         if not self.enable_prefix_caching or bytes <= 0:
             return
@@ -886,6 +1092,14 @@ class MemoryModel():
         else:
             req.storage_cache_hit = declared_hit
             req.storage_last_node = None
+
+        if (self.system_state is not None and not req.has_executed
+                and req.declared_prefix_source_request_id is None):
+            donor = res
+            if self.prefix_storage is not None and res_storage.hit_length > donor.hit_length:
+                donor = res_storage
+            req.prefix_cache_source_request_id = (
+                donor.last_device_node.source_request_id if donor.hit_length else None)
         
         req.prefix_cache_hit = max(req.npu_cache_hit, req.storage_cache_hit)
         # if req.num_computed_tokens < req.prefix_cache_hit:
