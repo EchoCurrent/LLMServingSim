@@ -25,6 +25,8 @@ class Request:
         self.num_computed_tokens = 0  # Tracks actual computed tokens (vLLM style)
         self.has_executed = False
         self.evict = False
+        self.evicted_pool = "L2"
+        self.execution_pool = "L1"
         self.end_time = -1
         self.latency = -1
         self.queuing_delay = -1
@@ -124,6 +126,7 @@ class Batch:
         # this batch.  HBFrame executes these decisions physically; it must not
         # choose a different request to move between pools.
         self.logical_pool_transfers = []
+        self.hbframe_memory_only = False
     def log(self):
         print("-------------------------Batch Log------------------------")
         for key in self.__dict__.keys():

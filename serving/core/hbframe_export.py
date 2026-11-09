@@ -26,6 +26,7 @@ class HBFrameFrontendConfig:
     model_config: dict[str, object] | None = None
     rank_memory: dict[int, dict[str, int]] | None = None
     require_local_kv: bool = False
+    l1e_policy: str = "promote"
     max_num_seqs: int = 128
     max_num_batched_tokens: int = 2048
     long_prefill_token_threshold: int = 0
@@ -144,6 +145,7 @@ def _request_snapshot(req, scheduled_tokens: dict[int, int]) -> dict[str, object
         "is_prefill": bool(req.is_prefill()),
         "num_computed_tokens": int(req.num_computed_tokens),
         "scheduled_tokens": int(scheduled_tokens.get(req.id, 0)),
+        "execution_pool": req.execution_pool,
         "chunk_len": int(getattr(req, "chunk_len", 0)),
         "prefix_cache_hit": int(getattr(req, "prefix_cache_hit", 0)),
         "npu_cache_hit": int(getattr(req, "npu_cache_hit", 0)),
@@ -197,6 +199,7 @@ def snapshot_batch(batch, scheduler: Scheduler, *, extra_attrs=None) -> HBFrameB
             "fired": tuple(int(value) for value in batch.fired),
             "end": tuple(int(value) for value in batch.end),
             "pd_role": scheduler.pd_type or "colocated",
+            "memory_only": batch.hbframe_memory_only,
             "hbframe_scheduler_decision": dict(getattr(scheduler, "_hbframe_last_decision", {}) or {}),
             "logical_memory": {
                 "schema": "hbframe-logical-memory-v1",
@@ -269,6 +272,7 @@ class HBFrameServingFrontend:
                     if hasattr(scheduler.memory, "npu_prefix_cache"):
                         scheduler.memory.npu_prefix_cache.capacity = scheduler.memory.mem_for_kv
             scheduler.memory.require_local_kv = config.require_local_kv
+            scheduler.memory.l1e_policy = config.l1e_policy
             return scheduler
 
         if str(config.pd_mode).lower() == "disaggregated":
@@ -303,6 +307,7 @@ class HBFrameServingFrontend:
                 num_experts,
                 num_experts_per_tok=model_config.get("num_experts_per_tok", 1),
                 routing_policy=config.expert_routing_policy,
+                hash_layers=model_config.get("num_hash_layers",0),
                 seed=42,
                 block_copy=False,
                 hot_expert_fraction=config.moe_hot_expert_fraction,
@@ -451,6 +456,8 @@ class HBFrameServingFrontend:
             batch = scheduler.schedule(self.current_time_ns, scheduler.start_npu)
             if batch is None:
                 continue
+            if batch.hbframe_memory_only:
+                return snapshot_batch(batch, scheduler)
             self._active_batches[(int(scheduler.instance_id), int(batch.batch_id))] = batch
             return snapshot_batch(
                 batch,

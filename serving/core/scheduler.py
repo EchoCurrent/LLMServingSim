@@ -46,9 +46,45 @@ class Scheduler:
         # memory model
         self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype, weight_residency=weight_residency, l2_retains_l1=l2_retains_l1, l2_scope=l2_scope, kv_eviction_has_fallback=kv_eviction_has_fallback, model_config=self.config, rank_memory=rank_memory)
         self._hbframe_last_decision = {}
-
-        # logger
+        self.memory_waiting = {}
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
+
+    def _memory_ready(self, req):
+        protected = self.memory.waiting_request_ids
+        return req.id not in protected and req.prefix_cache_source_request_id not in protected
+
+    def _park_hbframe_promotions(self, requests, transfers, current, sys):
+        if not self.memory._system_l1e:
+            return None
+        # Streamed L1 is a per-layer supply contract. Its bounded window is
+        # prepared and consumed within the forward, not a persistent replica.
+        if any(pool['prefetch_layers'] for pool in self.memory._system_l1.values()):
+            return None
+        loads = [(req, self.memory.execution_transfers(req)) for req in requests]
+        waiting = [req for req, moves in loads if moves]
+        if not waiting:
+            return None
+        moves = [*transfers, *(move for _, items in loads for move in items)]
+        batch = Batch(self.get_batch_id(), self.model, 0, 0, [], [], 0, 0, [], [], [], current, 0)
+        batch.requests = waiting
+        batch.logical_pool_transfers = moves
+        batch.evict = sum(m['size_bytes'] for m in moves
+                          if m['source_pool'] == 'L1' or m['target_pool'] == 'L2')
+        batch.load = sum(m['size_bytes'] for m in moves
+                         if m['source_pool'] != 'L1' and m['target_pool'] != 'L2')
+        batch.scheduled_tokens = {}
+        batch.fired.append(sys)
+        batch.hbframe_memory_only = True
+        protected = {req.id for req in waiting}
+        protected.update(req.prefix_cache_source_request_id for req in waiting
+                         if req.prefix_cache_source_request_id is not None)
+        self.memory_waiting[batch.batch_id] = protected
+        self.memory.waiting_request_ids.update(protected)
+        return batch
+
+    def complete_memory_transfer(self, batch_id):
+        del self.memory_waiting[batch_id]
+        self.memory.waiting_request_ids = set().union(*self.memory_waiting.values())
 
 
     def _apply_system_prefix_state(self, req):
@@ -76,8 +112,16 @@ class Scheduler:
         req.num_computed_tokens = max(int(req.num_computed_tokens), int(getattr(req, "prefix_cache_hit", 0)))
         self._hbframe_last_decision.setdefault("prefix_decisions", []).append(dict(decision))
 
-    def _commit_hbframe_prefix_restores(self, requests):
+    def _commit_hbframe_prefix_restores(self, requests, existing=()):
         transfers = []
+        if self.memory._system_l1e:
+            handled = {item["request_id"] for item in existing if item["source_pool"] != "L1"}
+            for req in requests:
+                req.execution_pool = self.memory._candidate_pools.get(req.id, "L1")
+                if req.id not in handled:
+                    transfers.extend(self.memory.execution_transfers(req))
+                req.hbframe_prefix_restore_pending = False
+            return transfers
         for req in requests:
             if not req.hbframe_prefix_restore_pending:
                 continue
@@ -177,7 +221,7 @@ class Scheduler:
                 return None
 
             # scheduling start
-            batch_req = [req for req in self.request if req.arrival <= current]
+            batch_req = [req for req in self.request if req.arrival <= current and self._memory_ready(req)]
 
             # max_num_seqs limits total running requests (vLLM behavior)
             running_reqs = sum(len(b.requests) for b in self.inflight)
@@ -305,7 +349,7 @@ class Scheduler:
                 victim_requests = (self.request if self.memory.system_state is None
                                    else self.memory._system_active_requests)
                 gen_req = [req for req in victim_requests
-                           if req is not batch_req[0] and not req.evict
+                           if req is not batch_req[0] and (not req.evict or (self.memory._system_l1e and req.evicted_pool == "L1E"))
                            and req.num_computed_tokens > 0
                            and self.memory.can_evict(req)]
                 # Initialized history is capacity ballast: it has no backing
@@ -333,11 +377,12 @@ class Scheduler:
 
                 victim = gen_req[-1]
                 victim_size = self.memory.get_evict_kv(victim)
+                victim.evicted_pool = self.memory.eviction_target(victim)
                 evict_size += victim_size
                 logical_pool_transfers.append({
                     "request_id": int(victim.id),
-                    "source_pool": "L1",
-                    "target_pool": "L2",
+                    "source_pool": self.memory.eviction_source(victim),
+                    "target_pool": victim.evicted_pool,
                     "size_bytes": int(victim_size),
                     "size_scope": "per_rank",
                     "reason": "scheduler_evict",
@@ -379,6 +424,9 @@ class Scheduler:
             kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
 
             # delete from request queue
+            parked = self._park_hbframe_promotions(batch_req, logical_pool_transfers, current, sys)
+            if parked is not None:
+                return parked
             for req in batch_req:
                 for i, req_ in enumerate(self.request):
                     if req_.id == req.id:
@@ -389,20 +437,12 @@ class Scheduler:
                     # load evicted kv cache
                     request_load_size = self.memory.get_evict_kv(req)
                     load_size += request_load_size
-                    logical_pool_transfers.append({
-                        "request_id": int(req.id),
-                        "source_pool": "L2",
-                        "target_pool": "L1",
-                        "size_bytes": int(request_load_size),
-                        "size_scope": "per_rank",
-                        "reason": "scheduler_load",
-                        "retains_backing": bool(self.memory.l2_retains_l1),
-                    })
+                    logical_pool_transfers.extend(self.memory.resume_transfers(req, request_load_size))
                     req.evict = False
                     self.logger.info("Loading the request #%d", req.id)
 
             # ============ STEP 4: Allocate memory ============
-            logical_pool_transfers.extend(self._commit_hbframe_prefix_restores(batch_req))
+            logical_pool_transfers.extend(self._commit_hbframe_prefix_restores(batch_req, logical_pool_transfers))
             self.memory.reserve_logical_batch(batch_req, scheduled_tokens)
             if kv_size > 0 and self.memory.system_state is None:
                 self.memory.allocate(kv_size, Device.NPU)
@@ -452,12 +492,12 @@ class Scheduler:
             committed_evict_bytes = sum(
                 int(item["size_bytes"])
                 for item in logical_pool_transfers
-                if item["source_pool"] == "L1" and item["target_pool"] == "L2"
+                if item["target_pool"] == "L2" or item["source_pool"] == "L1"
             )
             committed_load_bytes = sum(
                 int(item["size_bytes"])
                 for item in logical_pool_transfers
-                if item["source_pool"] == "L2" and item["target_pool"] == "L1"
+                if item["target_pool"] != "L2" and item["source_pool"] != "L1"
             )
             batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, committed_evict_bytes, committed_load_bytes)
             # add already fired system
@@ -511,7 +551,7 @@ class Scheduler:
                 return None
 
             # scheduling start
-            batch_req = [req for req in self.request if req.arrival <= current]
+            batch_req = [req for req in self.request if req.arrival <= current and self._memory_ready(req)]
 
             # max_num_seqs limits total running requests (vLLM behavior)
             running_reqs = sum(len(b.requests) for b in self.inflight)
@@ -652,7 +692,7 @@ class Scheduler:
                 victim_requests = (self.request if self.memory.system_state is None
                                    else self.memory._system_active_requests)
                 gen_req = [req for req in victim_requests if req is not batch_req[0]
-                           and not req.evict and req.num_computed_tokens > 0
+                           and (not req.evict or (self.memory._system_l1e and req.evicted_pool == "L1E")) and req.num_computed_tokens > 0
                            and self.memory.can_evict(req)]
                 if len(gen_req) == 0:
                     # print("gen_req length == 0 (No decode) => return None (No Batch)")
@@ -672,12 +712,13 @@ class Scheduler:
 
 
                 victim_size = self.memory.get_evict_kv(victim)
+                victim.evicted_pool = self.memory.eviction_target(victim)
                 victim.evict = True
                 evicted_req.append(victim)
                 logical_pool_transfers.append({
                     "request_id": int(victim.id),
-                    "source_pool": "L1",
-                    "target_pool": "L2",
+                    "source_pool": self.memory.eviction_source(victim),
+                    "target_pool": victim.evicted_pool,
                     "size_bytes": int(victim_size),
                     "size_scope": "per_rank",
                     "reason": "scheduler_evict",
@@ -717,6 +758,10 @@ class Scheduler:
             # ============ STEP 4: Allocate memory & handle evicted requests ============
             evict_load_size = 0
             prefix_load_size = 0
+
+            parked = self._park_hbframe_promotions(batch_req, logical_pool_transfers, current, sys)
+            if parked is not None:
+                return parked
             
             for req in batch_req:
                 # Remove from request queue
@@ -752,15 +797,7 @@ class Scheduler:
                             self.memory.unlock_prefix(req, Device.CPU)
                         request_load_size = self.memory.get_evict_kv(req)
                         evict_load_size += request_load_size
-                        logical_pool_transfers.append({
-                            "request_id": int(req.id),
-                            "source_pool": "L2",
-                            "target_pool": "L1",
-                            "size_bytes": int(request_load_size),
-                            "size_scope": "per_rank",
-                            "reason": "scheduler_load",
-                            "retains_backing": bool(self.memory.l2_retains_l1),
-                        })
+                        logical_pool_transfers.extend(self.memory.resume_transfers(req, request_load_size))
                     else:
                         # No fallback tier: the KV was dropped, not written out.
                         # Rewind the sequence and recompute its prompt instead of
@@ -778,7 +815,7 @@ class Scheduler:
                     self.logger.info("Loading the request #%d", req.id)
 
             # ============ STEP 5: Build batch with lists ============
-            logical_pool_transfers.extend(self._commit_hbframe_prefix_restores(batch_req))
+            logical_pool_transfers.extend(self._commit_hbframe_prefix_restores(batch_req, logical_pool_transfers))
             self.memory.reserve_logical_batch(batch_req, scheduled_tokens)
             total_len = 0
             kv_len = 0
@@ -850,12 +887,12 @@ class Scheduler:
             committed_evict_bytes = sum(
                 int(item["size_bytes"])
                 for item in logical_pool_transfers
-                if item["source_pool"] == "L1" and item["target_pool"] == "L2"
+                if item["target_pool"] == "L2" or item["source_pool"] == "L1"
             )
             committed_load_bytes = sum(
                 int(item["size_bytes"])
                 for item in logical_pool_transfers
-                if item["source_pool"] == "L2" and item["target_pool"] == "L1"
+                if item["target_pool"] != "L2" and item["source_pool"] != "L1"
             )
             batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, committed_evict_bytes, committed_load_bytes)
             batch.fired.append(sys)
