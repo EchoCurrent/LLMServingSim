@@ -146,6 +146,18 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
 
 
 class RadixCache():
+    def __getstate__(self):
+        # Synchronization and key callbacks are rebuilt with the metadata tree.
+        return {k:v for k,v in self.__dict__.items() if k not in {'_lock','get_child_key_fn'}}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
+        if self.page_size == 1:
+            self.get_child_key_fn = lambda key: key[0]
+        else:
+            self.get_child_key_fn = lambda key: tuple(key[:self.page_size])
+
     def __init__(
         self,
         node_id,
