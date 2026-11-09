@@ -182,6 +182,8 @@ class Router:
             'input_toks': int(row['input_toks']),
             'output_toks': int(row['input_toks'] + row['output_toks']),
             'arrival_time_ns': int(row['arrival_time_ns']),
+            'session_id': row.get('session_id'),
+            'sub_request_index': row.get('sub_request_index'),
         }
         req_data['prefix_cache_hit'] = self._declared_prefix_hit(row, req_data['input_toks'])
         self._attach_prefix_source_metadata(req_data, row)

@@ -58,6 +58,7 @@ class GateRouter:
         block_copy=True,
         hot_expert_fraction=0.125,
         hot_token_fraction=0.8,
+        hash_layers=0,
     ):
         self.instance_id = instance_id
         self.E = int(num_local_experts)
@@ -66,6 +67,7 @@ class GateRouter:
         self.seed = seed
         self.rnd = random.Random(seed) if seed is not None else random
         self.block_copy = bool(block_copy)
+        self.hash_layers = int(hash_layers)
         self.hot_expert_fraction = max(0.0, min(1.0, float(hot_expert_fraction)))
         self.hot_token_fraction = max(0.0, min(1.0, float(hot_token_fraction)))
 
@@ -110,14 +112,15 @@ class GateRouter:
             result &= 0xFFFFFFFFFFFFFFFF
         return result
 
-    def _hash_routing(self, token_idx, E, k, *, request_id=0, layer_num=0):
+    def _hash_routing(self, token_idx, E, k, *, request_id=0, layer_num=0, policy=None):
         seed = self._stable_mix(self.seed or 0, request_id, token_idx, layer_num)
         hot_count = min(E, max(k, int(round(E * self.hot_expert_fraction))))
-        if self.routing_policy == "HOTSPOT":
+        policy = self.routing_policy if policy is None else policy
+        if policy == "HOTSPOT":
             use_hot = int(seed % 10_000) < int(self.hot_token_fraction * 10_000)
             pool_start = 0 if use_hot else hot_count
             pool_size = hot_count if use_hot else max(k, E - hot_count)
-        elif self.routing_policy == "REQUEST_AFFINE":
+        elif policy == "REQUEST_AFFINE":
             pool_size = hot_count
             pool_start = int(self._stable_mix(request_id, layer_num) % E)
         else:
@@ -200,7 +203,9 @@ class GateRouter:
 
     def _selected_experts(self, layer_num, token_index, token_identities):
         request_id, token_position = self._token_identity(token_identities, token_index)
-        if self.routing_policy in {"BALANCED", "UNIFORM"}:
+        if layer_num < self.hash_layers:
+            return self._hash_routing(token_position,self.E,self.k,request_id=request_id,layer_num=layer_num,policy="HASH")
+        if self.routing_policy in {"BALANCED", "UNIFORM"} and layer_num >= self.hash_layers:
             offset = int(self._stable_mix(self.seed or 0, layer_num) % self.E)
             stride = max(1, self.E // self.k)
             return [
@@ -217,7 +222,7 @@ class GateRouter:
         return self.routing_fn(token_index, self.E, self.k)
 
     def _route_expert_counts(self, layer_num, total_len, ep_size, source_tokens, token_identities):
-        if self.routing_policy in {"BALANCED", "UNIFORM"}:
+        if self.routing_policy in {"BALANCED", "UNIFORM"} and layer_num >= self.hash_layers:
             return self._route_balanced_expert_counts(
                 layer_num,
                 total_len,
