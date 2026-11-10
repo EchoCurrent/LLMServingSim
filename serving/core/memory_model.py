@@ -303,7 +303,7 @@ class MemoryModel():
     def _system_batch_space(self, requests, scheduled_tokens):
         """Count new bytes and the union of restored ranges in each logical pool."""
         from memory_hierarchy.logical_mapping import (
-            append_working_bytes, cache_tile_allocation_bytes, kv_allocation_cost, kv_range_cost, range_union_bytes,
+            append_working_bytes, cache_tile_allocation_bytes, kv_allocation_cost, kv_range_cost, range_union_bytes, kv_append_shared_bytes,
         )
         growth = {pid: 0 for pid in self._system_pools}
         data_growth = {pid: 0 for pid, pool in self._system_pools.items() if "data_capacity_bytes" in pool}
@@ -361,7 +361,7 @@ class MemoryModel():
                     full = cache_bytes(self.cache_layout, after, allocated=True)
                 else:
                     full = (after + self.block_size - 1) // self.block_size * self.block_size * unit
-                added = max(0, full - mapped - slack)
+                added = max(0, full - mapped - slack) + kv_append_shared_bytes(rows,req.id,req.num_computed_tokens,after,self.block_size)
                 if pid in data_growth and choice == "L1" and not streamed:
                     data_growth[pid] += added
                 charge = append_working_bytes(pool, req.id, req.num_computed_tokens,
@@ -446,7 +446,7 @@ class MemoryModel():
                             if not row.get("streaming_stage_bytes"):
                                 continue
                             ranges.setdefault((row.get("model_layer_id",row["layer_id"]),row["object_uid"],req.id), []).append(
-                                (row["object_offset_bytes"], row["object_offset_bytes"]+row["size_bytes"]*count//row["token_count"]))
+                                (row["object_offset_bytes"], row["object_offset_bytes"]+row["streaming_stage_bytes"]*count//row["token_count"]))
                     fresh += max(0, req.num_computed_tokens-covered)*pool["max_layer_bytes_per_token"]
                 by_layer = {}
                 for (layer, uid, request_id), spans in ranges.items():
@@ -814,10 +814,18 @@ class MemoryModel():
         if not sources or (sources == {target}) or (target == "L1E" and sources <= {"L1", "L1E"}):
             return []
         source = "L2" if "L2" in sources else "L1E"
-        return [dict(request_id=req.id, source_pool=source, target_pool=target,
-            size_bytes=self.get_kv(req.num_computed_tokens), size_scope="per_rank",
-            reason="execution_promotion", retains_backing=self.l2_retains_l1,
-            token_start=0, token_count=req.num_computed_tokens)]
+        # Copy the committed Blocks selected by the scheduler. The next
+        # scheduled token has no KV to restore yet; append produces it later.
+        rank=self._system_reference_rank
+        rows=self._system_mappings.get((rank,req.id),())
+        if not rows and req.prefix_cache_source_request_id is not None:
+            rows=self._system_mappings.get((rank,req.prefix_cache_source_request_id),())
+        return [dict(request_id=req.id,source_pool=source,target_pool=target,
+            size_bytes=row['size_bytes'],size_scope='per_rank',reason='execution_promotion',
+            retains_backing=self.l2_retains_l1,token_start=row['token_start'],token_count=row['token_count'])
+            for row in rows if row['token_start']<req.num_computed_tokens
+                and row.get('execution_pool','L2')!=target]
+
 
     def get_weight(self):
         """Per-GPU model weight in bytes.
